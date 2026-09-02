@@ -67,6 +67,7 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 filterwarnings = [
     "error",
-    # discord.py imports the deprecated stdlib `audioop` for voice support.
-    "ignore:'audioop' is deprecated:DeprecationWarning",
+    # discord.py's own deprecations are not ours to fix, and a new one lands with
+    # every CPython release (stdlib audioop, asyncio.iscoroutinefunction, ...).
+    "ignore::DeprecationWarning:discord.*",
 ]
