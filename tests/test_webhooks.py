@@ -53,6 +53,30 @@ def test_accepts_bytes() -> None:
     assert verify_webhook(BODY.encode(), sign(), SECRET, now=now)["id"]
 
 
+def test_the_shared_sdk_vector() -> None:
+    """Computed with the server's PHP formula; every TheDiscordList SDK asserts it."""
+    body = (
+        '{"id":"d1","event":"webhook.ping","created_at":"2023-11-14T22:13:20+00:00",'
+        '"listing":{"id":"1","type":"bot","name":"Bot",'
+        '"url":"https://thediscordlist.com/bots/1"},"data":{"message":"hi"}}'
+    )
+    header = "t=1700000000,v1=b6eeea31d04c3f86990dcbb706dfaf988c9ff2fc234316ae77e168831127dc59"
+
+    assert sign(body, 1_700_000_000, "whsec_test") == header
+    event = verify_webhook(body, header, "whsec_test", now=lambda: 1_700_000_000.0)
+    assert event["event"] == "webhook.ping"
+
+
+def test_accepts_an_uppercase_signature() -> None:
+    t, v1 = sign().split(",v1=")
+    assert verify_webhook(BODY, f"{t},v1={v1.upper()}", SECRET, now=now)
+
+
+def test_a_header_part_with_extra_equals_signs_still_parses() -> None:
+    """Parts split on the first `=` only, so a value containing `=` is not malformed."""
+    assert verify_webhook(BODY, f"{sign()},v0=YWJj==", SECRET, now=now)
+
+
 @pytest.mark.parametrize(
     ("body", "signature", "code"),
     [

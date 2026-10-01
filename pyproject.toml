@@ -5,31 +5,61 @@ build-backend = "hatchling.build"
 [project]
 name = "thediscordlist"
 dynamic = ["version"]
-description = "Publish your discord.py bot's stats, heartbeat and commands to TheDiscordList, and verify its webhooks."
+description = "Publish your discord.py, Pycord, nextcord or disnake bot's stats, heartbeat and commands to TheDiscordList, and verify its webhooks."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "TheDiscordList" }]
-keywords = ["discord", "discord.py", "thediscordlist", "bot-list", "autopost", "webhooks"]
+keywords = [
+    "discord",
+    "discord.py",
+    "pycord",
+    "py-cord",
+    "nextcord",
+    "disnake",
+    "thediscordlist",
+    "bot-list",
+    "autopost",
+    "webhooks",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Framework :: AsyncIO",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Communications :: Chat",
     "Topic :: Internet",
     "Typing :: Typed",
 ]
-dependencies = ["discord.py>=2.4,<3", "aiohttp>=3.9,<4"]
+# No Discord library here: Pycord installs under discord.py's `discord` import
+# name, so depending on either one breaks every user of the other.
+dependencies = ["aiohttp>=3.9,<4"]
+
+[project.optional-dependencies]
+discordpy = ["discord.py>=2.4,<3"]
+pycord = ["py-cord>=2.6,<3"]
+nextcord = ["nextcord>=2.6,<4"]
+disnake = ["disnake>=2.9,<3"]
 
 [project.urls]
-Homepage = "https://github.com/TheDiscordList/integration-discordpy"
+Homepage = "https://thediscordlist.com"
 Documentation = "https://thediscordlist.com/docs/api"
+Repository = "https://github.com/TheDiscordList/integration-discordpy"
 Issues = "https://github.com/TheDiscordList/integration-discordpy/issues"
+Changelog = "https://github.com/TheDiscordList/integration-discordpy/blob/main/CHANGELOG.md"
 
 [dependency-groups]
 dev = ["pytest>=8", "pytest-asyncio>=1.0", "ruff>=0.12", "mypy>=1.15"]
+
+[tool.uv]
+conflicts = [[{ extra = "discordpy" }, { extra = "pycord" }]]
 
 [tool.hatch.version]
 path = "src/thediscordlist/__init__.py"
@@ -38,7 +68,7 @@ path = "src/thediscordlist/__init__.py"
 packages = ["src/thediscordlist"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src", "tests", "docs", "examples", "README.md", "LICENSE"]
+include = ["src", "tests", "docs", "examples", "README.md", "CHANGELOG.md", "LICENSE"]
 
 [tool.ruff]
 line-length = 100
@@ -57,8 +87,8 @@ ignore = ["S311"]
 python_version = "3.10"
 strict = true
 files = ["src"]
-# discord.py is duck-typed throughout (`Client`, `AutoShardedClient`, `Bot` and
-# mocks all satisfy the same reads), so the client is deliberately `Any`.
+# The client is duck-typed throughout (discord.py, Pycord, nextcord and disnake
+# clients, bots and mocks all satisfy the same reads), so it is deliberately `Any`.
 disallow_any_explicit = false
 
 [tool.pytest.ini_options]
@@ -67,7 +97,11 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 filterwarnings = [
     "error",
-    # discord.py's own deprecations are not ours to fix, and a new one lands with
+    # The libraries' own deprecations are not ours to fix, and a new one lands with
     # every CPython release (stdlib audioop, asyncio.iscoroutinefunction, ...).
     "ignore::DeprecationWarning:discord.*",
+    "ignore::DeprecationWarning:nextcord.*",
+    "ignore::DeprecationWarning:disnake.*",
+    # Python 3.14 flags `return` in `finally` (PEP 765); Pycord 2.8 still has one.
+    "ignore:'return' in a 'finally' block:SyntaxWarning",
 ]

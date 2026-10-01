@@ -1,4 +1,4 @@
-"""Fakes shared by the tests.
+"""Fakes shared by the tests, and the real libraries this environment has.
 
 The whole package duck-types the client, so a handful of attributes stands in
 for discord.py exactly as `Client`, `AutoShardedClient` and `commands.Bot` do.
@@ -6,9 +6,38 @@ for discord.py exactly as `Client`, `AutoShardedClient` and `commands.Bot` do.
 
 from __future__ import annotations
 
+import importlib
+from types import ModuleType
 from typing import Any
 
 from thediscordlist._http import Outcome
+
+
+def _installed(name: str, title: str) -> ModuleType | None:
+    """The library, if installed -- checked by title, since Pycord imports as `discord`."""
+    try:
+        module = importlib.import_module(name)
+    except ModuleNotFoundError as error:
+        if error.name != name:
+            raise  # installed but broken: fail loudly rather than skip every test
+        return None
+    return module if getattr(module, "__title__", None) == title else None
+
+
+#: Every supported library this environment has, by distribution name. CI installs
+#: one per job: discord.py and Pycord cannot share an environment.
+LIBRARIES = {
+    dist: module
+    for dist, name, title in [
+        ("discord.py", "discord", "discord"),
+        ("py-cord", "discord", "pycord"),
+        ("nextcord", "nextcord", "nextcord"),
+        ("disnake", "disnake", "disnake"),
+    ]
+    if (module := _installed(name, title)) is not None
+}
+
+collect_ignore = [] if "discord.py" in LIBRARIES else ["test_discordpy.py"]
 
 
 class FakeGuild:

@@ -1,9 +1,10 @@
-"""One call wires a discord.py client to its TheDiscordList listing."""
+"""One call wires a discord.py, Pycord, nextcord or disnake client to its listing."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from typing import Any
 
 from ._http import DEFAULT_BASE_URL, ApiClient
@@ -69,10 +70,10 @@ class Autoposter:
     def start(self) -> None:
         """Detects the topology and starts the publishers. Needs a running loop.
 
-        Called for you from the client's ``setup_hook`` -- after login, so the
-        application id is known, and before the gateway connects, so the first
-        heartbeat reports "connecting" rather than letting a booting bot look
-        dead on its own status page.
+        Called for you right after login (discord.py's ``setup_hook``, or the
+        end of ``login()`` elsewhere) -- so the application id is known, and
+        before the gateway connects, so the first heartbeat reports "connecting"
+        rather than letting a booting bot look dead on its own status page.
         """
         if self._started or self._closed:
             return
@@ -177,7 +178,7 @@ def autopost(
     cluster: tuple[int, int] | None = None,
     server_count: ServerCountFn | None = None,
 ) -> Autoposter:
-    """Wires a discord.py client to its TheDiscordList listing.
+    """Wires a Discord client to its TheDiscordList listing.
 
     .. code-block:: python
 
@@ -189,12 +190,14 @@ def autopost(
     loop. With a falsy ``token`` it warns once and returns an inert instance --
     a forgotten environment variable must never take down a deploy.
 
-    :param client: any :class:`discord.Client`, including ``commands.Bot`` and
-        the auto-sharded variants.
+    :param client: any ``Client`` from discord.py, Pycord, nextcord or disnake,
+        including their ``Bot`` and auto-sharded variants.
     :param token: the listing's stats token, from its manage page -> API tab.
     :param bot_id: the Discord *application* id. Defaults to
         ``client.application_id``, which is what the API keys on -- for legacy
-        bots it differs from the bot user id.
+        bots it differs from the bot user id. Pycord, nextcord and disnake only
+        learn it from READY, so without it one ``application_info()`` call is
+        made right after login.
     :param stats_interval: seconds between guild-count checks, and the hard
         floor between two posts. Clamped to a 60s minimum by the rate limit.
     :param post_empty_commands: send an empty command list, which *clears* the
@@ -212,7 +215,7 @@ def autopost(
         ApiClient(
             token or "",
             base_url,
-            f"thediscordlist-py/{__version__} (discord.py {_discord_version()})",
+            f"thediscordlist-py/{__version__} ({_library(client)})",
         ),
         bot_id=str(bot_id) if bot_id else None,
         stats=stats,
@@ -236,13 +239,15 @@ def autopost(
 def _wire(client: Any, poster: Autoposter) -> None:
     """Hangs start/stop off the client's own lifecycle.
 
-    ``setup_hook`` is the documented "after login, before connect" hook, which
-    is exactly when the application id is known and the gateway is not up yet.
-    Both hooks chain rather than replace, so a user override still runs.
+    The moment that matters is "after login, before connect": the application
+    id is known and the gateway is not up yet. discord.py names it
+    ``setup_hook``; Pycord, nextcord and disnake have no such hook, so the end
+    of ``login()`` stands in. Every hook chains rather than replaces, so a user
+    override still runs.
     """
-    if client.application_id is not None and _loop_running():
+    if getattr(client, "application_id", None) is not None and _loop_running():
         poster.start()  # already logged in -- e.g. called from a cog or on_ready
-    else:
+    elif hasattr(client, "setup_hook"):
         original_setup = client.setup_hook
 
         async def setup_hook() -> None:
@@ -250,6 +255,21 @@ def _wire(client: Any, poster: Autoposter) -> None:
             poster.start()
 
         client.setup_hook = setup_hook
+    else:
+        original_login = client.login
+
+        async def login(*args: Any, **kwargs: Any) -> None:
+            await original_login(*args, **kwargs)
+            # The forks only learn the application id from READY, so ask for it
+            # here, exactly as discord.py's own login() does.
+            if not poster._bot_id and getattr(client, "application_id", None) is None:
+                try:
+                    poster._bot_id = str((await client.application_info()).id)
+                except Exception:
+                    log.exception("[thediscordlist] could not fetch the application id")
+            poster.start()
+
+        client.login = login
 
     original_close = client.close
 
@@ -268,10 +288,12 @@ def _loop_running() -> bool:
     return True
 
 
-def _discord_version() -> str:
-    try:
-        import discord
+#: Pycord also imports as ``discord``; only its ``__title__`` tells the two apart.
+_DISTRIBUTIONS = {"discord": "discord.py", "pycord": "py-cord"}
 
-        return str(discord.__version__)
-    except Exception:  # pragma: no cover - discord.py is a hard dependency
-        return "unknown"
+
+def _library(client: Any) -> str:
+    """The client's library for the User-Agent, e.g. ``py-cord 2.8.1``."""
+    module = sys.modules.get(type(client).__module__.partition(".")[0])
+    title = str(getattr(module, "__title__", "unknown"))
+    return f"{_DISTRIBUTIONS.get(title, title)} {getattr(module, '__version__', 'unknown')}"

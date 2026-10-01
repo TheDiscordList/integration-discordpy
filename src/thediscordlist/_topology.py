@@ -1,9 +1,10 @@
 """Sharding-topology detection and the shard report the heartbeat sends.
 
-discord.py exposes its whole topology on the client, so detection is a pure
-function of `shard_id`, `shard_ids`, `shard_count` and `shards`. Everything is
-duck-typed rather than `isinstance`-checked, so a subclass, a mock or a future
-`AutoShardedBot` variant all work.
+discord.py and its forks (Pycord, nextcord, disnake) expose the whole topology
+on the client under the same names, so detection is a pure function of
+`shard_id`, `shard_ids`, `shard_count` and `shards`. Everything is duck-typed
+rather than `isinstance`-checked, so any of those libraries, a subclass, a mock
+or a future `AutoShardedBot` variant all work.
 
 Unlike discord.js there is no cross-process aggregation bus. A process that
 holds a *subset* of the shards can only see a fraction of the guilds, so it
