@@ -1,4 +1,4 @@
-"""TheDiscordList integration for discord.py.
+"""TheDiscordList integration for discord.py, Pycord, nextcord and disnake.
 
     import os
     import discord

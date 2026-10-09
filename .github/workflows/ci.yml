@@ -7,20 +7,35 @@ on:
 
 jobs:
   test:
+    name: ${{ matrix.library }} on Python ${{ matrix.python }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
+        # One library per job: discord.py and Pycord both install the `discord`
+        # package, so they can never share an environment.
+        library: [discordpy, pycord, nextcord, disnake]
         # 3.10 is not decoration: it is the only thing that turns
         # requires-python from a claim into a fact.
-        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python: ["3.10", "3.14"]
+        exclude:
+          # nextcord 3 needs 3.12+. On 3.10 the extra resolves to nextcord 2.6,
+          # which cannot even import without setuptools<81.
+          - { library: nextcord, python: "3.10" }
+        include:
+          - { library: discordpy, python: "3.11" }
+          - { library: discordpy, python: "3.12" }
+          - { library: discordpy, python: "3.13" }
+          - { library: nextcord, python: "3.12" }
+          # No Discord library at all: the core and the webhooks need none.
+          - { library: core, python: "3.12" }
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python }}
           enable-cache: true
-      - run: uv sync --group dev
+      - run: uv sync --group dev ${{ matrix.library != 'core' && format('--extra {0}', matrix.library) || '' }}
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run mypy

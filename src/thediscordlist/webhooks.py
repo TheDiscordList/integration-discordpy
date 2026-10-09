@@ -338,7 +338,7 @@ def aiohttp_webhook_handler(
     tolerance_seconds: int = DEFAULT_TOLERANCE_SECONDS,
     handler_timeout: float = DEFAULT_HANDLER_TIMEOUT,
 ) -> Callable[[Any], Awaitable[Any]]:
-    """An ``aiohttp.web`` route handler. aiohttp already ships with discord.py.
+    """An ``aiohttp.web`` route handler. aiohttp is this package's one dependency.
 
     .. code-block:: python
 
