@@ -84,8 +84,7 @@ poster = autopost(
 ```
 
 `stats_interval` is clamped to a 60-second minimum, which is also the floor
-between two posts: all three endpoints share one server-side rate-limit
-counter, so a tighter loop only starves the heartbeat.
+between two posts.
 
 The token may be pasted with surrounding whitespace or a leading `Bearer `.
 

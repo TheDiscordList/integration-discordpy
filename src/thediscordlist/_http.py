@@ -1,8 +1,8 @@
 """The one HTTP client every publisher shares.
 
 There is a single client-side suspension rather than one per endpoint, because
-the server keeps a single rate-limit counter per client IP across every bot
-route -- only the threshold differs. Heartbeats bypass it: a dropped stats post
+the server counts stats and commands against one per-bot budget. Heartbeats
+bypass it: a dropped stats post
 is a stale number, a dropped heartbeat is a false "down" on the user's public
 status page.
 """
