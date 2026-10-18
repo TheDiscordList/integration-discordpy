@@ -41,6 +41,24 @@ Get the token from your bot's manage page → **API** tab.
 | **Heartbeat** | `POST /bots/{id}/heartbeat` | every ~30s per process, starting before the gateway connects so a booting bot reads *connecting* rather than *down* |
 | **Commands** | `POST /bots/{id}/commands` | once, ~10s after ready — commands change on deploy, and a deploy is a restart |
 
+### Defaults
+
+- **Stats:** checked every 300s, and 20s after the last guild join or
+  removal. Never two posts within 60s. An unchanged count is skipped until
+  30 minutes have passed.
+- **Heartbeat:** every 30s plus 0–5s of jitter, retuned from each response to a
+  third of the server's grace window and kept within 15–60s.
+- **Commands:** once, 10s after ready.
+- **A `403`** (the endpoint needs a higher plan) pauses that publisher for 30
+  minutes, then it tries again.
+- **Requests** time out after 10s and get three attempts, backing off
+  1s · 2ⁿ (capped at 30s, jittered to 50–100%) and never past the publisher's
+  next run. Only network errors, `408`, `425`, `429` and `5xx` are retried. A
+  `429` waits out `Retry-After` or `X-RateLimit-Reset` — 60s when neither is
+  sent, never more than an hour.
+- **Webhooks:** a signature more than 300s from now is rejected. The handlers
+  cap the body at 1 MiB and give your callback 8s before answering `202`.
+
 Nothing here can raise into your bot. Every loop swallows its own exceptions,
 every `post_*()` returns a `PostResult` instead of raising, and problems are
 reported through the standard `logging` module under the `thediscordlist`
