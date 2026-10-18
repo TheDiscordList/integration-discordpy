@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from typing import Any
 
 import pytest
@@ -8,7 +10,10 @@ import pytest
 from conftest import FakeApi, FakeClient, FakeShard
 from thediscordlist._http import Outcome
 from thediscordlist._publishers import (
+    PLAN_REPROBE,
     STATS_FORCE_AFTER,
+    STATS_INTERVAL,
+    STATS_MIN_GAP,
     CommandsPublisher,
     Deps,
     HeartbeatPublisher,
@@ -21,6 +26,11 @@ BOT_ID = "123456789012345678"
 
 def make_deps(client: Any, api: FakeApi, **kwargs: Any) -> Deps:
     return Deps(api, client, detect_topology(client, **kwargs), BOT_ID)  # type: ignore[arg-type]
+
+
+@pytest.fixture
+def no_min_gap(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("thediscordlist._publishers.STATS_MIN_GAP", 0.0)
 
 
 # -- stats ------------------------------------------------------------------
@@ -39,12 +49,12 @@ async def test_stats_posts_the_count_and_always_sends_shard_count() -> None:
     assert api.bodies[0] == {"server_count": 42, "shard_count": 4}
 
 
+@pytest.mark.usefixtures("no_min_gap")
 async def test_stats_skips_an_unchanged_count() -> None:
     """Every post re-indexes the listing and fires a webhook, even unchanged."""
     client = FakeClient(guilds=42)
     api = FakeApi()
     stats = StatsPublisher(make_deps(client, api))
-    stats._interval = 0  # let the min-gap floor out of the way
 
     assert (await stats.post()).ok
     second = await stats.post()
@@ -53,11 +63,11 @@ async def test_stats_skips_an_unchanged_count() -> None:
     assert len(api.calls) == 1
 
 
+@pytest.mark.usefixtures("no_min_gap")
 async def test_stats_reposts_an_unchanged_count_eventually() -> None:
     client = FakeClient(guilds=42)
     api = FakeApi()
     stats = StatsPublisher(make_deps(client, api))
-    stats._interval = 0
 
     await stats.post()
     stats._last_post_at -= STATS_FORCE_AFTER + 1
@@ -66,11 +76,11 @@ async def test_stats_reposts_an_unchanged_count_eventually() -> None:
     assert len(api.calls) == 2
 
 
+@pytest.mark.usefixtures("no_min_gap")
 async def test_stats_posts_again_when_the_count_moves() -> None:
     client = FakeClient(guilds=42)
     api = FakeApi()
     stats = StatsPublisher(make_deps(client, api))
-    stats._interval = 0
 
     await stats.post()
     client.guilds.append(client.guilds[0])
@@ -91,6 +101,49 @@ async def test_stats_enforces_a_hard_floor_between_posts() -> None:
 
     assert second.skipped == "min-gap"
     assert len(api.calls) == 1
+
+
+async def test_a_min_gap_skip_retries_when_the_gap_ends_not_a_full_interval_later() -> None:
+    stats = StatsPublisher(make_deps(FakeClient(), FakeApi()))
+    await stats.post()
+
+    delay = await stats._tick()
+
+    assert stats._interval == STATS_INTERVAL
+    assert 0 < delay <= STATS_MIN_GAP
+
+
+async def test_a_guild_change_ends_the_wait_once_it_goes_quiet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("thediscordlist._publishers.STATS_DEBOUNCE", 0.01)
+    stats = StatsPublisher(make_deps(FakeClient(), FakeApi()))
+
+    waiting = asyncio.create_task(stats._wait(STATS_INTERVAL))
+    await asyncio.sleep(0)
+    stats.on_guild_change()
+
+    await asyncio.wait_for(waiting, 1)
+
+
+async def test_a_join_storm_cannot_hold_the_post_back_past_the_min_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("thediscordlist._publishers.STATS_DEBOUNCE", 0.05)
+    monkeypatch.setattr("thediscordlist._publishers.STATS_MIN_GAP", 0.2)
+    stats = StatsPublisher(make_deps(FakeClient(), FakeApi()))
+
+    async def storm() -> None:
+        while True:
+            stats.on_guild_change()
+            await asyncio.sleep(0.01)
+
+    storming = asyncio.create_task(storm())
+    started = time.monotonic()
+    await asyncio.wait_for(stats._wait(STATS_INTERVAL), 2)
+    storming.cancel()
+
+    assert time.monotonic() - started < 1
 
 
 async def test_stats_below_the_floor_is_clamped_and_warned(
@@ -174,6 +227,14 @@ async def test_the_retuned_cadence_is_clamped(grace: int, expected: float) -> No
     assert heartbeat._interval == expected
 
 
+@pytest.mark.parametrize(("interval", "expected"), [(1, 15.0), (45, 45.0), (600, 60.0)])
+async def test_a_configured_cadence_is_clamped_before_the_first_beat(
+    interval: float, expected: float
+) -> None:
+    heartbeat = HeartbeatPublisher(make_deps(FakeClient(), FakeApi()), interval)
+    assert heartbeat._interval == expected
+
+
 async def test_heartbeat_skips_a_beat_with_no_shards_to_report() -> None:
     client = FakeClient(shard_count=2, shards={})
     api = FakeApi()
@@ -254,6 +315,21 @@ async def test_a_403_suspends_rather_than_disables(caplog: pytest.LogCaptureFixt
     assert "higher plan" in caplog.text
 
 
+async def test_a_403_silences_the_heartbeat_until_the_reprobe() -> None:
+    """A free-tier bot must not keep beating every 30s into a plan gate."""
+    api = FakeApi(Outcome("plan", 403))
+    heartbeat = HeartbeatPublisher(make_deps(FakeClient(), api))
+
+    delay = await heartbeat._tick()
+
+    assert delay >= PLAN_REPROBE - 1
+    assert (await heartbeat._beat(manual=False)).skipped == "plan"
+    assert len(api.calls) == 1
+
+    heartbeat._suspended_until = 0.0
+    assert (await heartbeat._beat(manual=False)).ok
+
+
 async def test_a_404_never_reads_as_a_bad_token(caplog: pytest.LogCaptureFixture) -> None:
     stats = StatsPublisher(make_deps(FakeClient(), FakeApi(Outcome("config", 404))))
 
@@ -265,12 +341,12 @@ async def test_a_404_never_reads_as_a_bad_token(caplog: pytest.LogCaptureFixture
     assert "no bot listing found" in caplog.text
 
 
+@pytest.mark.usefixtures("no_min_gap")
 async def test_a_422_keeps_the_publisher_alive_and_is_reported_once(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     api = FakeApi(Outcome("payload", 422, {"message": "bad"}), Outcome("payload", 422, {}))
     stats = StatsPublisher(make_deps(FakeClient(), api))
-    stats._interval = 0
 
     with caplog.at_level(logging.WARNING, logger="thediscordlist"):
         await stats.post()
@@ -280,10 +356,10 @@ async def test_a_422_keeps_the_publisher_alive_and_is_reported_once(
     assert caplog.text.count("rejected the stats payload") == 1
 
 
+@pytest.mark.usefixtures("no_min_gap")
 async def test_a_manual_post_re_arms_a_disabled_publisher() -> None:
     api = FakeApi(Outcome("config", 404))
     stats = StatsPublisher(make_deps(FakeClient(), api))
-    stats._interval = 0
 
     await stats.post()
     assert stats._disabled == "not-found"
@@ -295,8 +371,6 @@ async def test_a_publisher_loop_survives_a_tick_that_raises(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Nothing in this package may take a bot down."""
-    import asyncio
-
     stats = StatsPublisher(make_deps(FakeClient(), FakeApi()))
     ticks = 0
 

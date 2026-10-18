@@ -44,6 +44,7 @@ __all__ = [
     "SIGNATURE_HEADER",
     "BotAdded",
     "BotStatsReported",
+    "ListingBumpReady",
     "ListingBumped",
     "ListingUpvoted",
     "ServerJoined",
@@ -67,6 +68,7 @@ IsoDate = str
 
 WebhookEventName = Literal[
     "listing.bumped",
+    "listing.bump_ready",
     "listing.upvoted",
     "server.joined",
     "bot.added",
@@ -93,7 +95,7 @@ class WebhookListing(TypedDict):
 
 
 class _Envelope(TypedDict):
-    #: UUID, equal to ``X-TDL-Delivery`` and stable across all 5 retries.
+    #: UUID, equal to ``X-TDL-Delivery`` and stable across all 5 attempts.
     id: str
     #: Enqueue time, NOT send time. Do not use it for freshness.
     created_at: IsoDate
@@ -110,6 +112,15 @@ class _BumpedData(TypedDict):
 class ListingBumped(_Envelope):
     event: Literal["listing.bumped"]
     data: _BumpedData
+
+
+class _BumpReadyData(TypedDict):
+    ready_at: IsoDate
+
+
+class ListingBumpReady(_Envelope):
+    event: Literal["listing.bump_ready"]
+    data: _BumpReadyData
 
 
 class _UpvotedData(TypedDict):
@@ -163,10 +174,15 @@ class WebhookPing(_Envelope):
     data: _PingData
 
 
-#: A bot listing only ever receives ``listing.bumped``, ``listing.upvoted``,
-#: ``bot.added``, ``bot.stats_reported`` and ``webhook.ping``.
+#: A bot listing never receives ``server.joined``.
 WebhookPayload = (
-    ListingBumped | ListingUpvoted | ServerJoined | BotAdded | BotStatsReported | WebhookPing
+    ListingBumped
+    | ListingBumpReady
+    | ListingUpvoted
+    | ServerJoined
+    | BotAdded
+    | BotStatsReported
+    | WebhookPing
 )
 
 ErrorCode = Literal[
@@ -212,8 +228,11 @@ def verify_webhook(
     JSON_UNESCAPED_UNICODE)`` and posts that same string, so re-serialising a
     parsed body escapes slashes and non-ASCII differently and can never verify.
 
-    :raises WebhookError: and nothing else.
+    :raises WebhookError: when the delivery does not verify.
+    :raises ValueError: when ``secret`` is empty, rather than accepting any
+        signature made with an empty key.
     """
+    _require_secret(secret)
     if not signature:
         raise WebhookError("MISSING_SIGNATURE", f"Missing {SIGNATURE_HEADER} header.")
 
@@ -262,6 +281,11 @@ def verify_webhook(
     return payload  # type: ignore[return-value]
 
 
+def _require_secret(secret: str) -> None:
+    if not secret or not secret.strip():
+        raise ValueError("A webhook secret is required.")
+
+
 # -- handlers ---------------------------------------------------------------
 
 EventHandler = Callable[[Any, WebhookContext], Awaitable[None] | None]
@@ -273,6 +297,12 @@ class _Options:
     on_event: EventHandler
     tolerance_seconds: int = DEFAULT_TOLERANCE_SECONDS
     handler_timeout: float = DEFAULT_HANDLER_TIMEOUT
+
+    def __post_init__(self) -> None:
+        _require_secret(self.secret)  # at startup, not on the first delivery
+
+
+_overrunning: set[asyncio.Task[None]] = set()
 
 
 def _context(headers: Mapping[str, str]) -> WebhookContext:
@@ -312,6 +342,10 @@ async def _dispatch(options: _Options, raw: bytes, headers: Mapping[str, str]) -
     task = asyncio.create_task(run())
     done, _ = await asyncio.wait({task}, timeout=options.handler_timeout)
     if not done:
+        # The loop holds tasks weakly, so an overrunning handler needs a
+        # reference to finish at all.
+        _overrunning.add(task)
+        task.add_done_callback(_overrunning.discard)
         # Never abandon an exception: log it whenever it eventually lands.
         task.add_done_callback(_log_late_failure)
         return 202

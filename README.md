@@ -37,9 +37,27 @@ Get the token from your bot's manage page → **API** tab.
 
 | | Endpoint | When |
 | --- | --- | --- |
-| **Stats** | `POST /bots/{id}/stats` | the guild count is checked every 60s and posted when it moves, plus every 30 minutes regardless |
+| **Stats** | `POST /bots/{id}/stats` | the guild count is checked every 5 minutes and shortly after a guild join or removal, and posted when it moves, plus every 30 minutes regardless |
 | **Heartbeat** | `POST /bots/{id}/heartbeat` | every ~30s per process, starting before the gateway connects so a booting bot reads *connecting* rather than *down* |
 | **Commands** | `POST /bots/{id}/commands` | once, ~10s after ready — commands change on deploy, and a deploy is a restart |
+
+### Defaults
+
+- **Stats:** checked every 300s, and 20s after the last guild join or
+  removal. Never two posts within 60s. An unchanged count is skipped until
+  30 minutes have passed.
+- **Heartbeat:** every 30s plus 0–5s of jitter, retuned from each response to a
+  third of the server's grace window and kept within 15–60s.
+- **Commands:** once, 10s after ready.
+- **A `403`** (the endpoint needs a higher plan) pauses that publisher for 30
+  minutes, then it tries again.
+- **Requests** time out after 10s and get three attempts, backing off
+  1s · 2ⁿ (capped at 30s, jittered to 50–100%) and never past the publisher's
+  next run. Only network errors, `408`, `425`, `429` and `5xx` are retried. A
+  `429` waits out `Retry-After` or `X-RateLimit-Reset` — 60s when neither is
+  sent, never more than an hour.
+- **Webhooks:** a signature more than 300s from now is rejected. The handlers
+  cap the body at 1 MiB and give your callback 8s before answering `202`.
 
 Nothing here can raise into your bot. Every loop swallows its own exceptions,
 every `post_*()` returns a `PostResult` instead of raising, and problems are
@@ -57,7 +75,7 @@ poster = autopost(
     stats=True,
     heartbeat=True,
     commands=True,
-    stats_interval=60.0,  # guild-count poll, and the hard floor between posts
+    stats_interval=300.0,  # guild-count check; joins and removals also post
     heartbeat_interval=30.0,  # starting cadence; retuned from the API's response
     post_empty_commands=False,  # an empty list CLEARS the listing
     cluster=None,  # (cluster_id, cluster_count) for multi-process bots
@@ -65,9 +83,10 @@ poster = autopost(
 )
 ```
 
-`stats_interval` is clamped to a 60-second minimum: all three endpoints share
-one server-side rate-limit counter, so a tighter loop only starves the
-heartbeat.
+`stats_interval` is clamped to a 60-second minimum, which is also the floor
+between two posts.
+
+The token may be pasted with surrounding whitespace or a leading `Bearer `.
 
 Manual posts, for the rare cases the loops do not cover:
 
@@ -138,7 +157,8 @@ differently and will never verify.
 
 Two ready-made servers, both answering `204` on success, `202` if your handler
 overruns 8 seconds, `500` if it raises (so the delivery is retried), `401` on a
-bad signature and `400` on a stale or malformed one:
+missing or bad signature and `400` on a stale or malformed one. Both, and
+`verify_webhook`, raise `ValueError` for an empty secret:
 
 ```python
 # aiohttp — already installed, because discord.py depends on it
@@ -166,7 +186,7 @@ async def on_event(event, ctx):
         await bot.get_channel(CHANNEL).send(f"{user['username']} voted! 💜")
 ```
 
-`ctx.delivery` is stable across all five retries — use it as an idempotency
+`ctx.delivery` is stable across all five attempts — use it as an idempotency
 key, for example `redis.set(ctx.delivery, 1, ex=86400, nx=True)`. A manual
 "redeliver" from the web UI deliberately mints a new id, so it is not dropped
 as a duplicate.
@@ -181,6 +201,7 @@ it. Ten consecutive failed deliveries disable an endpoint.
 | Event | Fires for | `data` |
 | --- | --- | --- |
 | `listing.bumped` | servers, bots | `points`, `bumped_at`, `next_bump_at`, `user` |
+| `listing.bump_ready` | servers, bots | `ready_at` |
 | `listing.upvoted` | servers, bots | `voted_at`, `total_upvotes`, `user` |
 | `server.joined` | servers | `joined_at`, `user` |
 | `bot.added` | bots | `added_at`, `user` |

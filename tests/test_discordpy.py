@@ -7,6 +7,8 @@ can run in `setup_hook`.
 
 from __future__ import annotations
 
+from typing import Any
+
 import discord
 import pytest
 from discord.ext import commands
@@ -89,6 +91,44 @@ async def test_autopost_hooks_a_real_bot_without_disturbing_it(
     assert poster.topology is not None
     assert poster.topology.kind == "single"
 
+    await poster.close()
+
+
+async def test_a_real_bot_hears_guild_changes_through_a_listener(
+    intents: discord.Intents,
+) -> None:
+    bot = commands.Bot(command_prefix="!", intents=intents)
+    bot._connection.application_id = 123456789012345678
+    poster = autopost(bot, "tok", base_url=DEAD)
+    assert poster._stats is not None
+
+    # What Bot.dispatch runs for a guild join; dispatching itself needs a logged-in loop.
+    for listener in bot.extra_events["on_guild_join"]:
+        await listener(object())
+
+    assert poster._stats._changed.is_set()
+    assert "on_guild_join" not in bot.__dict__  # the user's @bot.event slot stays free
+    await poster.close()
+
+
+async def test_a_real_client_hears_guild_changes_beside_its_own_handler(
+    intents: discord.Intents,
+) -> None:
+    client = discord.Client(intents=intents)
+    seen: list[Any] = []
+
+    @client.event
+    async def on_guild_remove(guild: Any) -> None:
+        seen.append(guild)
+
+    client._connection.application_id = 123456789012345678
+    poster = autopost(client, "tok", base_url=DEAD)
+    assert poster._stats is not None
+
+    await client.on_guild_remove("guild")  # what Client.dispatch looks up and runs
+
+    assert seen == ["guild"]
+    assert poster._stats._changed.is_set()
     await poster.close()
 
 

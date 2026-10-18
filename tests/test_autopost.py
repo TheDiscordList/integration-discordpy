@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import pytest
 
@@ -27,6 +28,49 @@ async def test_a_missing_token_is_inert_rather_than_fatal(
     assert (original_setup, original_close) != (None, None)
     assert "no stats token" in caplog.text
     assert (await poster.post_stats()).skipped == "disabled"
+
+
+@pytest.mark.parametrize("token", ["  tok\n", "Bearer tok", "bearer   tok "])
+async def test_a_pasted_token_is_cleaned_up(token: str) -> None:
+    client = FakeClient()
+    poster = autopost(client, token, base_url=DEAD, commands=False)
+
+    assert poster._api._headers["authorization"] == "Bearer tok"
+    await client.close()
+
+
+async def test_a_blank_token_is_treated_as_missing() -> None:
+    client = FakeClient()
+    poster = autopost(client, "   ")
+    assert "setup_hook" not in client.__dict__
+    assert (await poster.post_stats()).skipped == "disabled"
+
+
+def test_an_unknown_option_is_a_type_error() -> None:
+    with pytest.raises(TypeError, match="stat_interval"):
+        autopost(FakeClient(), None, stat_interval=120)  # type: ignore[call-arg]
+
+
+async def test_a_guild_change_wakes_stats_beside_the_users_own_handler() -> None:
+    client = FakeClient()
+    seen: list[Any] = []
+
+    async def on_guild_join(guild: Any) -> None:
+        seen.append(guild)
+
+    client.on_guild_join = on_guild_join  # type: ignore[attr-defined]
+    poster = Autoposter(client, FakeApi())  # type: ignore[arg-type]
+    poster.start()
+    assert poster._stats is not None
+
+    await client.on_guild_join("guild")  # type: ignore[attr-defined]
+    assert seen == ["guild"]
+    assert poster._stats._changed.is_set()
+
+    poster._stats._changed.clear()
+    await client.on_guild_remove("guild")  # type: ignore[attr-defined]
+    assert poster._stats._changed.is_set()
+    await poster.close()
 
 
 async def test_it_starts_immediately_when_the_client_is_already_logged_in() -> None:

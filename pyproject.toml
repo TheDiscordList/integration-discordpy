@@ -47,7 +47,6 @@ src = ["src", "tests"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "ASYNC", "S", "PT", "TID"]
 # S311: `random` is used for scheduling jitter, never for anything security-facing.
-# BLE001-adjacent broad excepts are deliberate: nothing here may crash a host bot.
 ignore = ["S311"]
 
 [tool.ruff.lint.per-file-ignores]
