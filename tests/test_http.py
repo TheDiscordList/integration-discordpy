@@ -81,8 +81,12 @@ async def test_a_successful_post_sends_the_token_and_parses_the_body(
         (401, "auth"),
         (403, "plan"),
         (404, "config"),
+        (405, "payload"),
+        (408, "transient"),
         (409, "config"),
+        (413, "payload"),
         (422, "payload"),
+        (425, "transient"),
         (500, "transient"),
         (503, "transient"),
     ],
@@ -118,6 +122,19 @@ async def test_transient_failures_are_retried_three_times(
     assert len(server.requests) == 3
 
 
+async def test_a_client_error_is_never_retried(
+    server: Server, make_client: Callable[[], ApiClient]
+) -> None:
+    server.reply(web.json_response({}, status=413), web.json_response({"ok": True}))
+    client = make_client()
+
+    outcome = await client.post("/bots/1/stats", {}, next_tick=600)
+    await client.close()
+
+    assert outcome.kind == "payload"
+    assert len(server.requests) == 1
+
+
 async def test_a_retry_is_dropped_when_the_next_tick_arrives_first(
     server: Server, make_client: Callable[[], ApiClient]
 ) -> None:
@@ -142,7 +159,7 @@ async def test_a_429_suspends_normal_traffic_but_never_heartbeats(
     )
     client = make_client()
 
-    throttled = await client.post("/bots/1/stats", {})
+    throttled = await client.post("/bots/1/stats", {}, next_tick=1)
     assert throttled.kind == "throttled"
     assert throttled.retry_after == 30
 
@@ -203,8 +220,41 @@ async def test_a_429_reset_header_beats_a_short_retry_after(
     )
     client = make_client()
 
-    await client.post("/bots/1/stats", {})
-    remaining = client._suspended_until - time.monotonic()
+    await client.post("/bots/1/stats", {}, next_tick=1)
+    remaining = client._rate_limited_until - time.monotonic()
     await client.close()
 
     assert 110 < remaining < 125
+
+
+async def test_a_429_is_retried_once_its_window_lifts_before_the_next_tick(
+    server: Server, make_client: Callable[[], ApiClient], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("thediscordlist._http.random.uniform", lambda a, b: 0.0)
+    server.reply(web.json_response({}, status=429, headers={"retry-after": "0.05"}))
+    client = make_client()
+
+    outcome = await client.post("/bots/1/stats", {}, next_tick=600)
+    await client.close()
+
+    assert outcome.kind == "ok"
+    assert len(server.requests) == 2
+
+
+async def test_a_429_never_suspends_for_more_than_an_hour(
+    server: Server, make_client: Callable[[], ApiClient]
+) -> None:
+    server.reply(
+        web.json_response(
+            {},
+            status=429,
+            headers={"retry-after": "86400", "x-ratelimit-reset": str(int(time.time()) + 86400)},
+        )
+    )
+    client = make_client()
+
+    await client.post("/bots/1/stats", {}, next_tick=1)
+    remaining = client._rate_limited_until - time.monotonic()
+    await client.close()
+
+    assert 3590 < remaining <= 3602

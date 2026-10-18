@@ -25,15 +25,17 @@ log = logging.getLogger("thediscordlist")
 DEFAULT_BASE_URL = "https://thediscordlist.com/api"
 TIMEOUT_SECONDS = 10.0
 MAX_ATTEMPTS = 3
+#: However far out Retry-After or X-RateLimit-Reset points, never go quiet for longer.
+MAX_RATE_LIMIT_WAIT = 3600.0
 
 OutcomeKind = Literal[
     "ok",  # 2xx
-    "payload",  # 400/422 -- our body is wrong; the next tick may carry valid data
+    "payload",  # any other 4xx -- the request is wrong; the next tick may carry valid data
     "auth",  # 401 -- fatal, disable everything
     "plan",  # 403 -- Gold gate; reprobe, never disable
     "config",  # 404/409 -- fatal for this publisher
     "throttled",  # 429
-    "transient",  # 408, 5xx, connection errors
+    "transient",  # 408, 425, 5xx, connection errors
     "dropped",  # never sent: client-side suspension
 ]
 
@@ -68,10 +70,11 @@ def _classify(status: int, body: Any, retry_after: str | None) -> Outcome:
     # never "bad token", so probing cannot enumerate. Do not report it as auth.
     if status in (404, 409):
         return Outcome("config", status)
-    if status in (400, 422):
-        return Outcome("payload", status, body)
     if status == 429:
         return Outcome("throttled", 429, retry_after=_seconds(retry_after) or 60.0)
+    # Retrying the same request cannot turn any other 4xx into a success.
+    if 400 <= status < 500 and status not in (408, 425):
+        return Outcome("payload", status, body)
     return Outcome("transient", status, error=RuntimeError(f"TheDiscordList responded {status}."))
 
 
@@ -92,7 +95,7 @@ class ApiClient:
         self._session: aiohttp.ClientSession | None = None
         # Instance state, never module state: two Autoposters in one process must
         # not share a budget.
-        self._suspended_until = 0.0
+        self._rate_limited_until = 0.0
 
     async def post(
         self,
@@ -102,25 +105,30 @@ class ApiClient:
         heartbeat: bool = False,
         next_tick: float | None = None,
     ) -> Outcome:
-        """One request, retrying only transient failures.
+        """One request, retrying transient failures and, once the window lifts, a 429.
 
-        `next_tick` is the time until this publisher runs again. If a backoff
+        `next_tick` is the time until this publisher runs again. If a wait
         would outlast it the attempt is dropped: the next tick carries fresher
         data, and a failed request still burns rate-limit budget.
         """
         outcome = Outcome("dropped")
         for attempt in range(MAX_ATTEMPTS):
-            outcome = await self._once(path, body, heartbeat)
-            if outcome.kind != "transient" or attempt == MAX_ATTEMPTS - 1:
+            # A request that just waited out the window goes through it, even
+            # if the loop wakes a clock tick early.
+            outcome = await self._once(path, body, heartbeat or outcome.kind == "throttled")
+            if outcome.kind == "transient":
+                delay = backoff(attempt)
+            elif outcome.kind == "throttled":
+                delay = self._rate_limited_until - time.monotonic()
+            else:
                 break
-            delay = backoff(attempt)
-            if next_tick is not None and delay >= next_tick:
+            if attempt == MAX_ATTEMPTS - 1 or (next_tick is not None and delay >= next_tick):
                 break
             await asyncio.sleep(delay)
         return outcome
 
-    async def _once(self, path: str, body: Any, heartbeat: bool) -> Outcome:
-        if not heartbeat and time.monotonic() < self._suspended_until:
+    async def _once(self, path: str, body: Any, ignore_limit: bool) -> Outcome:
+        if not ignore_limit and time.monotonic() < self._rate_limited_until:
             return Outcome("dropped")
 
         if self._session is None or self._session.closed:
@@ -147,7 +155,9 @@ class ApiClient:
         if outcome.kind == "throttled":
             reset = _seconds(headers.get("x-ratelimit-reset"))
             until = max(outcome.retry_after, reset - time.time() if reset else 0.0)
-            self._suspended_until = time.monotonic() + until + random.uniform(0.0, 2.0)
+            self._rate_limited_until = (
+                time.monotonic() + min(until, MAX_RATE_LIMIT_WAIT) + random.uniform(0.0, 2.0)
+            )
         return outcome
 
     async def close(self) -> None:
