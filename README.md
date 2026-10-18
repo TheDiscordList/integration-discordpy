@@ -138,7 +138,8 @@ differently and will never verify.
 
 Two ready-made servers, both answering `204` on success, `202` if your handler
 overruns 8 seconds, `500` if it raises (so the delivery is retried), `401` on a
-bad signature and `400` on a stale or malformed one:
+missing or bad signature and `400` on a stale or malformed one. Both, and
+`verify_webhook`, raise `ValueError` for an empty secret:
 
 ```python
 # aiohttp — already installed, because discord.py depends on it
@@ -166,7 +167,7 @@ async def on_event(event, ctx):
         await bot.get_channel(CHANNEL).send(f"{user['username']} voted! 💜")
 ```
 
-`ctx.delivery` is stable across all five retries — use it as an idempotency
+`ctx.delivery` is stable across all five attempts — use it as an idempotency
 key, for example `redis.set(ctx.delivery, 1, ex=86400, nx=True)`. A manual
 "redeliver" from the web UI deliberately mints a new id, so it is not dropped
 as a duplicate.
@@ -181,6 +182,7 @@ it. Ten consecutive failed deliveries disable an endpoint.
 | Event | Fires for | `data` |
 | --- | --- | --- |
 | `listing.bumped` | servers, bots | `points`, `bumped_at`, `next_bump_at`, `user` |
+| `listing.bump_ready` | servers, bots | `ready_at` |
 | `listing.upvoted` | servers, bots | `voted_at`, `total_upvotes`, `user` |
 | `server.joined` | servers | `joined_at`, `user` |
 | `bot.added` | bots | `added_at`, `user` |

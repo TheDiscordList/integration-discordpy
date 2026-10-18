@@ -11,6 +11,7 @@ from thediscordlist.webhooks import (
     MAX_BODY_BYTES,
     WebhookContext,
     WebhookError,
+    aiohttp_webhook_handler,
     asgi_webhook_app,
     verify_webhook,
 )
@@ -34,6 +35,22 @@ BODY = json.dumps(
 )
 
 
+BUMP_READY = json.dumps(
+    {
+        "id": "0c7c2f4e-8a0d-4bde-9d0e-5b8f6f1a2c3d",
+        "event": "listing.bump_ready",
+        "created_at": "2026-08-14T12:34:56+00:00",
+        "listing": {
+            "id": "161660517914509312",
+            "type": "bot",
+            "name": "Test",
+            "url": "https://thediscordlist.com/bots/161660517914509312",
+        },
+        "data": {"ready_at": "2026-08-14T12:34:56+00:00"},
+    }
+)
+
+
 def sign(body: str = BODY, t: int = int(NOW), secret: str = SECRET) -> str:
     digest = hmac.new(secret.encode(), f"{t}.{body}".encode(), hashlib.sha256).hexdigest()
     return f"t={t},v1={digest}"
@@ -51,6 +68,25 @@ def test_accepts_a_valid_signature() -> None:
 
 def test_accepts_bytes() -> None:
     assert verify_webhook(BODY.encode(), sign(), SECRET, now=now)["id"]
+
+
+def test_accepts_a_bump_ready_delivery() -> None:
+    event = verify_webhook(BUMP_READY, sign(BUMP_READY), SECRET, now=now)
+    assert event["event"] == "listing.bump_ready"
+    assert event["data"]["ready_at"] == "2026-08-14T12:34:56+00:00"
+
+
+@pytest.mark.parametrize("secret", ["", "   "])
+def test_an_empty_secret_is_a_configuration_error_not_a_key(secret: str) -> None:
+    """An empty HMAC key would verify any delivery signed with an empty key."""
+    with pytest.raises(ValueError, match="secret is required"):
+        verify_webhook(BODY, sign(secret=secret), secret, now=now)
+
+
+@pytest.mark.parametrize("factory", [asgi_webhook_app, aiohttp_webhook_handler])
+def test_a_handler_refuses_to_start_without_a_secret(factory: Any) -> None:
+    with pytest.raises(ValueError, match="secret is required"):
+        factory("", lambda event, ctx: None)
 
 
 @pytest.mark.parametrize(

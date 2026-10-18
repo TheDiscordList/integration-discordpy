@@ -39,7 +39,7 @@ poster = autopost(bot, os.environ["TDL_TOKEN"])
 async def on_tdl_event(event: dict, ctx: WebhookContext) -> None:
     """Anything that raises here answers 500 and the delivery is retried.
 
-    `ctx.delivery` is stable across all five retries, so it is the right
+    `ctx.delivery` is stable across all five attempts, so it is the right
     idempotency key if you write to a database.
     """
     if event["event"] == "listing.upvoted":
