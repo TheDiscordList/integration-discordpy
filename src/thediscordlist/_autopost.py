@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from ._http import DEFAULT_BASE_URL, ApiClient
 from ._publishers import (
     HEARTBEAT_DEFAULT_INTERVAL,
-    STATS_MIN_INTERVAL,
+    STATS_INTERVAL,
     CommandsPublisher,
     Deps,
     HeartbeatPublisher,
@@ -41,7 +42,7 @@ class Autoposter:
         stats: bool = True,
         heartbeat: bool = True,
         commands: bool = True,
-        stats_interval: float = STATS_MIN_INTERVAL,
+        stats_interval: float = STATS_INTERVAL,
         heartbeat_interval: float = HEARTBEAT_DEFAULT_INTERVAL,
         post_empty_commands: bool = False,
         cluster: tuple[int, int] | None = None,
@@ -124,6 +125,7 @@ class Autoposter:
         if self._want["stats"]:
             self._stats = StatsPublisher(deps, self._stats_interval, self._server_count)
             self._stats.start()
+            _on_guild_change(self._client, self._stats.on_guild_change)
         if self._want["heartbeat"]:
             self._heartbeat = HeartbeatPublisher(deps, self._heartbeat_interval)
             self._heartbeat.start()
@@ -171,7 +173,7 @@ def autopost(
     stats: bool = True,
     heartbeat: bool = True,
     commands: bool = True,
-    stats_interval: float = STATS_MIN_INTERVAL,
+    stats_interval: float = STATS_INTERVAL,
     heartbeat_interval: float = HEARTBEAT_DEFAULT_INTERVAL,
     post_empty_commands: bool = False,
     cluster: tuple[int, int] | None = None,
@@ -195,8 +197,11 @@ def autopost(
     :param bot_id: the Discord *application* id. Defaults to
         ``client.application_id``, which is what the API keys on -- for legacy
         bots it differs from the bot user id.
-    :param stats_interval: seconds between guild-count checks, and the hard
-        floor between two posts. Clamped to a 60s minimum by the rate limit.
+    :param stats_interval: seconds between guild-count checks, 300 by default.
+        A guild join or removal also posts, 20s after the last one. Clamped to
+        a 60s minimum, which is also the hard floor between two posts.
+    :param heartbeat_interval: the starting cadence, 30 by default and clamped
+        to 15-60s. Each response retunes it from the server's grace window.
     :param post_empty_commands: send an empty command list, which *clears* the
         listing. Off by default.
     :param cluster: ``(cluster_id, cluster_count)`` when the bot's shards are
@@ -258,6 +263,28 @@ def _wire(client: Any, poster: Autoposter) -> None:
         await original_close()
 
     client.close = close
+
+
+def _on_guild_change(client: Any, callback: Callable[[], None]) -> None:
+    """Runs ``callback`` on every guild join and removal, beside the user's own handlers."""
+
+    async def listener(*_: Any) -> None:
+        callback()
+
+    for event in ("on_guild_join", "on_guild_remove"):
+        if hasattr(client, "add_listener"):  # commands.Bot
+            client.add_listener(listener, event)
+            continue
+
+        # A plain Client dispatches only to its own on_<event> attribute, so chain onto it.
+        original = getattr(client, event, None)
+
+        async def chained(*args: Any, _original: Any = original) -> None:
+            callback()
+            if _original is not None:
+                await _original(*args)
+
+        setattr(client, event, chained)
 
 
 def _loop_running() -> bool:

@@ -37,7 +37,7 @@ Get the token from your bot's manage page → **API** tab.
 
 | | Endpoint | When |
 | --- | --- | --- |
-| **Stats** | `POST /bots/{id}/stats` | the guild count is checked every 60s and posted when it moves, plus every 30 minutes regardless |
+| **Stats** | `POST /bots/{id}/stats` | the guild count is checked every 5 minutes and shortly after a guild join or removal, and posted when it moves, plus every 30 minutes regardless |
 | **Heartbeat** | `POST /bots/{id}/heartbeat` | every ~30s per process, starting before the gateway connects so a booting bot reads *connecting* rather than *down* |
 | **Commands** | `POST /bots/{id}/commands` | once, ~10s after ready — commands change on deploy, and a deploy is a restart |
 
@@ -57,7 +57,7 @@ poster = autopost(
     stats=True,
     heartbeat=True,
     commands=True,
-    stats_interval=60.0,  # guild-count poll, and the hard floor between posts
+    stats_interval=300.0,  # guild-count check; joins and removals also post
     heartbeat_interval=30.0,  # starting cadence; retuned from the API's response
     post_empty_commands=False,  # an empty list CLEARS the listing
     cluster=None,  # (cluster_id, cluster_count) for multi-process bots
@@ -65,9 +65,9 @@ poster = autopost(
 )
 ```
 
-`stats_interval` is clamped to a 60-second minimum: all three endpoints share
-one server-side rate-limit counter, so a tighter loop only starves the
-heartbeat.
+`stats_interval` is clamped to a 60-second minimum, which is also the floor
+between two posts: all three endpoints share one server-side rate-limit
+counter, so a tighter loop only starves the heartbeat.
 
 Manual posts, for the rare cases the loops do not cover:
 

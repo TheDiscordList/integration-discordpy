@@ -21,9 +21,12 @@ from ._topology import ServerCountFn, Topology, collect_shards, measure_server_c
 
 log = logging.getLogger("thediscordlist")
 
-#: Also the hard floor between two stats posts, so the ceiling is structurally
-#: one request per minute rather than statistically.
-STATS_MIN_INTERVAL = 60.0
+STATS_INTERVAL = 300.0
+#: A guild join or removal posts once the changes have been quiet this long.
+STATS_DEBOUNCE = 20.0
+#: The hard floor between two stats posts, so the ceiling is structurally one
+#: request per minute rather than statistically.
+STATS_MIN_GAP = 60.0
 #: Republish an unchanged count this often, so a listing never looks abandoned.
 STATS_FORCE_AFTER = 1800.0
 STATS_FIRST_DELAY = 5.0
@@ -93,6 +96,9 @@ class Publisher:
         """Does the work and returns the seconds to wait before the next tick."""
         raise NotImplementedError
 
+    async def _wait(self, delay: float) -> None:
+        await asyncio.sleep(delay)
+
     async def _guarded(self) -> None:
         try:
             await self._prime()
@@ -104,7 +110,7 @@ class Publisher:
                 except Exception:
                     log.exception("[thediscordlist] the %s publisher failed", self.kind)
                     delay = 60.0
-                await asyncio.sleep(delay)
+                await self._wait(delay)
         except asyncio.CancelledError:
             pass
 
@@ -191,14 +197,12 @@ class Publisher:
 
 
 class StatsPublisher(Publisher):
-    """Polls the guild count and posts it when it moves.
+    """Posts the guild count when it moves: on a timer, and shortly after a guild change.
 
-    Polling replaces discord.js's debounced ``guildCreate``/``guildDelete``
-    hooks: the guild count is cheap to read, the poll cadence *is* the
-    rate-limit floor, and the unchanged-value skip does the rest. That skip
-    matters more than it looks -- every ``/stats`` post re-indexes the listing,
-    evaluates achievements and fires a ``bot.stats_reported`` webhook even when
-    the number did not move, and there is no server-side dedupe.
+    The unchanged-value skip matters more than it looks -- every ``/stats``
+    post re-indexes the listing, evaluates achievements and fires a
+    ``bot.stats_reported`` webhook even when the number did not move, and there
+    is no server-side dedupe.
     """
 
     kind: PublisherKind = "stats"
@@ -206,30 +210,57 @@ class StatsPublisher(Publisher):
     def __init__(
         self,
         deps: Deps,
-        interval: float = STATS_MIN_INTERVAL,
+        interval: float = STATS_INTERVAL,
         server_count: ServerCountFn | None = None,
     ) -> None:
         super().__init__(deps)
-        if interval < STATS_MIN_INTERVAL:
+        if interval < STATS_MIN_GAP:
             log.warning(
                 "[thediscordlist] stats_interval=%.0fs is below the %.0fs rate-limit floor; "
                 "using %.0fs",
                 interval,
-                STATS_MIN_INTERVAL,
-                STATS_MIN_INTERVAL,
+                STATS_MIN_GAP,
+                STATS_MIN_GAP,
             )
-        self._interval = max(interval, STATS_MIN_INTERVAL)
+        self._interval = max(interval, STATS_MIN_GAP)
         self._server_count = server_count
         self._last_post_at = 0.0
         self._last: tuple[int, int] | None = None
+        self._changed = asyncio.Event()
 
     async def _prime(self) -> None:
         await self._d.client.wait_until_ready()
         await asyncio.sleep(STATS_FIRST_DELAY)
 
     async def _tick(self) -> float:
-        await self._publish(manual=False)
+        result = await self._publish(manual=False)
+        now = time.monotonic()
+        if result.skipped == "plan":
+            return self._suspended_until - now
+        if result.skipped == "min-gap":
+            return self._last_post_at + STATS_MIN_GAP - now
         return self._interval
+
+    def on_guild_change(self) -> None:
+        self._changed.set()
+
+    async def _wait(self, delay: float) -> None:
+        """A trailing debounce on guild changes, capped so a join storm cannot starve the post."""
+        if not await self._changed_within(delay):
+            return
+        cap = time.monotonic() + STATS_MIN_GAP
+        while (left := cap - time.monotonic()) > 0 and await self._changed_within(
+            min(STATS_DEBOUNCE, left)
+        ):
+            pass
+
+    async def _changed_within(self, seconds: float) -> bool:
+        try:
+            await asyncio.wait_for(self._changed.wait(), seconds)
+        except asyncio.TimeoutError:
+            return False
+        self._changed.clear()
+        return True
 
     async def post(self) -> PostResult:
         self._rearm()
@@ -245,7 +276,7 @@ class StatsPublisher(Publisher):
                 return PostResult(False, None, "plan")
             # A hard monotonic floor. A join storm, a mass reconnect and a manual
             # post_stats() all route through it.
-            if self._last_post_at and now - self._last_post_at < self._interval:
+            if self._last_post_at and now - self._last_post_at < STATS_MIN_GAP:
                 return PostResult(False, None, "min-gap")
 
             count = await measure_server_count(self._d.client, self._d.topology, self._server_count)
@@ -280,7 +311,7 @@ class HeartbeatPublisher(Publisher):
 
     def __init__(self, deps: Deps, interval: float = HEARTBEAT_DEFAULT_INTERVAL) -> None:
         super().__init__(deps)
-        self._interval = interval
+        self._interval = _clamp_heartbeat(interval)
 
     def start(self) -> None:
         # Every beat hard-deletes the listing's cluster rows whose
@@ -300,8 +331,9 @@ class HeartbeatPublisher(Publisher):
 
     async def _tick(self) -> float:
         await self._beat(manual=False)
+        delay = max(self._interval, self._suspended_until - time.monotonic())
         # Jitter de-locksteps N cluster processes that all started from one deploy.
-        return self._interval + random.uniform(0.0, HEARTBEAT_JITTER)
+        return delay + random.uniform(0.0, HEARTBEAT_JITTER)
 
     async def post(self) -> PostResult:
         self._rearm()
@@ -311,6 +343,8 @@ class HeartbeatPublisher(Publisher):
         async with self._lock:
             if not manual and self._disabled is not None:
                 return PostResult(False, None, "disabled")
+            if time.monotonic() < self._suspended_until:
+                return PostResult(False, None, "plan")
             cluster_count = self._d.topology.cluster_count
             if cluster_count is None:
                 return PostResult(False, None, "cluster-count-unknown")
@@ -336,8 +370,12 @@ class HeartbeatPublisher(Publisher):
         if outcome.kind == "ok" and isinstance(outcome.body, dict):
             grace = outcome.body.get("next_beat_within_seconds")
             if isinstance(grace, (int, float)) and not isinstance(grace, bool) and grace > 0:
-                self._interval = min(max(grace / 3, HEARTBEAT_MIN_INTERVAL), HEARTBEAT_MAX_INTERVAL)
+                self._interval = _clamp_heartbeat(grace / 3)
         return super()._react(outcome)
+
+
+def _clamp_heartbeat(interval: float) -> float:
+    return min(max(interval, HEARTBEAT_MIN_INTERVAL), HEARTBEAT_MAX_INTERVAL)
 
 
 class CommandsPublisher(Publisher):
