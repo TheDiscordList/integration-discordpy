@@ -69,6 +69,8 @@ poster = autopost(
 between two posts: all three endpoints share one server-side rate-limit
 counter, so a tighter loop only starves the heartbeat.
 
+The token may be pasted with surrounding whitespace or a leading `Bearer `.
+
 Manual posts, for the rare cases the loops do not cover:
 
 ```python
