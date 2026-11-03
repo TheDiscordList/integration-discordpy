@@ -147,7 +147,8 @@ class ApiClient:
             async with self._session.post(f"{self._base_url}{path}", json=body) as response:
                 # Always read the body inside the context manager, or the
                 # connection is returned to the pool unread.
-                text = await response.text()
+                # A proxy's error page need not be UTF-8, and this client never raises.
+                text = await response.text(errors="replace")
                 status, headers = response.status, response.headers
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as error:
             return Outcome("transient", error=error)

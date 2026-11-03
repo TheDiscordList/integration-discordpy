@@ -213,6 +213,18 @@ async def test_a_non_json_body_does_not_raise(
     assert outcome.kind == "transient"
 
 
+async def test_a_body_that_is_not_utf8_does_not_raise(
+    server: Server, make_client: Callable[[], ApiClient]
+) -> None:
+    server.reply(web.Response(body=b"\xff\xfe", status=502, content_type="text/html"))
+    client = make_client()
+
+    outcome = await client.post("/bots/1/stats", {}, next_tick=0.0001)
+    await client.close()
+
+    assert (outcome.kind, outcome.status) == ("transient", 502)
+
+
 async def test_the_session_can_be_closed_twice(
     server: Server, make_client: Callable[[], ApiClient]
 ) -> None:
