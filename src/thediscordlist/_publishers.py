@@ -12,7 +12,7 @@ import asyncio
 import logging
 import random
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -196,6 +196,19 @@ class Publisher:
         """An explicit ``post_*()`` re-arms a disabled publisher; a restart is the other way."""
         self._disabled = None
 
+    async def _rearmed(self, post: Callable[[], Awaitable[PostResult]]) -> PostResult:
+        """Runs a manual post, then restarts the loop a disable ended unless it disabled again.
+
+        After the post rather than from ``_rearm``, so the loop's first tick does
+        not double it.
+        """
+        was_disabled = self._disabled is not None
+        self._rearm()
+        result = await post()
+        if was_disabled and self._disabled is None:
+            self.start()
+        return result
+
 
 class StatsPublisher(Publisher):
     """Posts the guild count when it moves: on a timer, and shortly after a guild change.
@@ -264,8 +277,7 @@ class StatsPublisher(Publisher):
         return True
 
     async def post(self) -> PostResult:
-        self._rearm()
-        return await self._publish(manual=True)
+        return await self._rearmed(lambda: self._publish(manual=True))
 
     async def _publish(self, *, manual: bool) -> PostResult:
         async with self._lock:
@@ -341,8 +353,7 @@ class HeartbeatPublisher(Publisher):
         return delay + random.uniform(0.0, HEARTBEAT_JITTER)
 
     async def post(self) -> PostResult:
-        self._rearm()
-        return await self._beat(manual=True)
+        return await self._rearmed(lambda: self._beat(manual=True))
 
     async def _beat(self, *, manual: bool) -> PostResult:
         async with self._lock:

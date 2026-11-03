@@ -472,6 +472,32 @@ async def test_a_manual_post_re_arms_a_disabled_publisher() -> None:
     assert (await stats.post()).ok
 
 
+@pytest.mark.usefixtures("no_min_gap")
+async def test_a_manual_post_restarts_the_loop_a_disable_ended() -> None:
+    """Without the loop, post_stats() works once and the count goes stale."""
+    api = FakeApi(Outcome("config", 404))
+    stats = StatsPublisher(make_deps(FakeClient(), api))
+
+    await stats.post()
+    assert stats._task is None
+
+    await stats.post()
+    assert stats._task is not None
+    assert not stats._task.done()
+    stats.stop()
+
+
+@pytest.mark.usefixtures("no_min_gap")
+async def test_a_manual_post_leaves_the_loop_off_when_it_disables_again() -> None:
+    api = FakeApi(Outcome("config", 404), Outcome("config", 404))
+    stats = StatsPublisher(make_deps(FakeClient(), api))
+
+    await stats.post()
+    await stats.post()
+
+    assert stats._task is None
+
+
 async def test_a_publisher_loop_survives_a_tick_that_raises(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
