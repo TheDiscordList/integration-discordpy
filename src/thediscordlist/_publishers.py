@@ -38,6 +38,7 @@ HEARTBEAT_JITTER = 5.0
 
 #: Offset from the first stats post: the two share one server-side rate budget.
 COMMANDS_DELAY = 10.0
+COMMANDS_RETRY = 300.0
 
 #: The Gold tier is derived per request from Stripe, so it can flip mid-run.
 PLAN_REPROBE = 1800.0
@@ -386,7 +387,9 @@ class CommandsPublisher(Publisher):
     """Posts the application command list once, shortly after ready.
 
     No periodic re-check and no content hashing: commands change on deploy, and
-    a deploy is a restart. ``post_commands()`` covers an in-process re-register.
+    a deploy is a restart. A post that fails would leave them stale until the
+    next one, so it tries again until it lands. ``post_commands()`` covers an
+    in-process re-register.
     """
 
     kind: PublisherKind = "commands"
@@ -401,7 +404,10 @@ class CommandsPublisher(Publisher):
                 return  # global commands are identical in every process
             await self._d.client.wait_until_ready()
             await asyncio.sleep(COMMANDS_DELAY)
-            await self._publish()
+            while True:
+                if not _worth_retrying(await self._publish()):
+                    return
+                await asyncio.sleep(COMMANDS_RETRY)
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -437,3 +443,12 @@ class CommandsPublisher(Publisher):
                 return PostResult(False, None, "empty")
 
             return await self._send(f"/bots/{self._d.bot_id}/commands", {"commands": raw})
+
+
+def _worth_retrying(result: PostResult) -> bool:
+    """A success, nothing to send, or a 4xx the same request would only get again end it."""
+    if result.ok or result.skipped in ("empty", "disabled"):
+        return False
+    if result.skipped is not None:
+        return True
+    return result.status is None or not 400 <= result.status < 500 or result.status in (408, 425)

@@ -18,6 +18,7 @@ from thediscordlist._publishers import (
     Deps,
     HeartbeatPublisher,
     StatsPublisher,
+    _worth_retrying,
 )
 from thediscordlist._topology import detect_topology
 
@@ -292,6 +293,100 @@ async def test_a_discord_failure_does_not_escape_the_publisher() -> None:
     api = FakeApi()
 
     assert (await CommandsPublisher(make_deps(client, api)).post()).skipped == "fetch-failed"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        Outcome("transient", 502, error=RuntimeError("Bad Gateway")),
+        Outcome("transient", error=OSError("connection reset")),
+        Outcome("dropped"),
+        Outcome("throttled", 429, retry_after=1.0),
+    ],
+)
+async def test_commands_tries_again_until_it_lands(
+    monkeypatch: pytest.MonkeyPatch, failure: Outcome
+) -> None:
+    monkeypatch.setattr("thediscordlist._publishers.COMMANDS_DELAY", 0.0)
+    monkeypatch.setattr("thediscordlist._publishers.COMMANDS_RETRY", 0.0)
+    api = FakeApi(failure, failure)
+    publisher = CommandsPublisher(make_deps(FakeClient(commands=[{"name": "ping"}]), api))
+
+    publisher.start()
+    assert publisher._task is not None
+    await asyncio.wait_for(publisher._task, 1)
+
+    assert len(api.calls) == 3
+
+
+async def test_commands_tries_again_after_a_failed_discord_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("thediscordlist._publishers.COMMANDS_DELAY", 0.0)
+    monkeypatch.setattr("thediscordlist._publishers.COMMANDS_RETRY", 0.0)
+    client = FakeClient(commands=[{"name": "ping"}])
+    fetch = client.http.get_global_commands
+    attempts = 0
+
+    async def flaky(application_id: int) -> Any:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("Discord is down")
+        return await fetch(application_id)
+
+    client.http.get_global_commands = flaky  # type: ignore[method-assign]
+    api = FakeApi()
+    publisher = CommandsPublisher(make_deps(client, api))
+
+    publisher.start()
+    assert publisher._task is not None
+    await asyncio.wait_for(publisher._task, 1)
+
+    assert attempts == 2
+    assert len(api.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [Outcome("payload", 422, {}), Outcome("auth", 401), Outcome("config", 404)],
+)
+async def test_commands_stops_at_a_4xx_the_same_request_would_only_get_again(
+    monkeypatch: pytest.MonkeyPatch, failure: Outcome
+) -> None:
+    monkeypatch.setattr("thediscordlist._publishers.COMMANDS_DELAY", 0.0)
+    monkeypatch.setattr("thediscordlist._publishers.COMMANDS_RETRY", 0.0)
+    api = FakeApi(failure)
+    publisher = CommandsPublisher(make_deps(FakeClient(commands=[{"name": "ping"}]), api))
+
+    publisher.start()
+    assert publisher._task is not None
+    await asyncio.wait_for(publisher._task, 1)
+
+    assert len(api.calls) == 1
+
+
+async def test_commands_stops_when_discord_lists_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("thediscordlist._publishers.COMMANDS_DELAY", 0.0)
+    monkeypatch.setattr("thediscordlist._publishers.COMMANDS_RETRY", 0.0)
+    client = FakeClient(commands=[])
+    publisher = CommandsPublisher(make_deps(client, FakeApi()))
+
+    publisher.start()
+    assert publisher._task is not None
+    await asyncio.wait_for(publisher._task, 1)
+
+    assert len(client.http.calls) == 1
+
+
+async def test_commands_reprobes_after_a_403_without_sending_until_the_suspension_ends() -> None:
+    """The plan gate can lift mid-run, so a 403 keeps its 30-minute reprobe."""
+    api = FakeApi(Outcome("plan", 403))
+    publisher = CommandsPublisher(make_deps(FakeClient(commands=[{"name": "ping"}]), api))
+
+    assert _worth_retrying(await publisher._publish())
+    assert _worth_retrying(await publisher._publish())
+    assert len(api.calls) == 1
 
 
 # -- the error taxonomy, as publishers see it -------------------------------
