@@ -386,6 +386,25 @@ async def test_commands_stops_at_a_4xx_the_same_request_would_only_get_again(
     assert len(api.calls) == 1
 
 
+async def test_a_manual_post_that_lands_ends_the_pending_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The retry would only post the same list again, against the budget stats share."""
+    monkeypatch.setattr("thediscordlist._publishers.COMMANDS_DELAY", 0.0)
+    monkeypatch.setattr("thediscordlist._publishers.COMMANDS_RETRY", 0.05)
+    api = FakeApi(Outcome("transient", 502, error=RuntimeError("Bad Gateway")))
+    publisher = CommandsPublisher(make_deps(FakeClient(commands=[{"name": "ping"}]), api))
+
+    publisher.start()
+    await asyncio.sleep(0.01)
+    assert len(api.calls) == 1
+
+    assert (await publisher.post()).ok
+    await asyncio.sleep(0.1)
+
+    assert len(api.calls) == 2
+
+
 async def test_commands_stops_when_discord_lists_none(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("thediscordlist._publishers.COMMANDS_DELAY", 0.0)
     monkeypatch.setattr("thediscordlist._publishers.COMMANDS_RETRY", 0.0)

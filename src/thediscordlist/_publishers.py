@@ -444,7 +444,10 @@ class CommandsPublisher(Publisher):
 
     async def post(self) -> PostResult:
         self._rearm()
-        return await self._publish()
+        result = await self._publish()
+        if result.ok:
+            self.stop()  # a pending retry would only post the same list again
+        return result
 
     async def _publish(self) -> PostResult:
         async with self._lock:
