@@ -90,10 +90,27 @@ def test_a_booting_bot_reports_connecting_not_disconnected() -> None:
     assert collect_shards(client, detect_topology(client))[0]["status"] == "connecting"
 
 
-def test_a_closed_shard_reports_disconnected() -> None:
+def test_a_shard_mid_reconnect_reports_connecting_not_disconnected() -> None:
+    """A closed socket is transient; on the deployed server `disconnected` opens an incident."""
     client = FakeClient(shard_count=2, shards={0: FakeShard(0), 1: FakeShard(1, closed=True)})
     statuses = [s["status"] for s in collect_shards(client, detect_topology(client))]
-    assert statuses == ["ready", "disconnected"]
+    assert statuses == ["ready", "connecting"]
+
+
+def test_only_a_closed_client_reports_disconnected() -> None:
+    client = FakeClient(shard_count=2, shards={0: FakeShard(0), 1: FakeShard(1)}, closed=True)
+    statuses = [s["status"] for s in collect_shards(client, detect_topology(client))]
+    assert statuses == ["disconnected", "disconnected"]
+
+
+def test_shards_not_launched_yet_report_connecting() -> None:
+    client = FakeClient(shard_count=3, shards={0: FakeShard(0)}, ready=False)
+    shards = collect_shards(client, detect_topology(client))
+    assert [(s["id"], s["status"]) for s in shards] == [
+        (0, "connecting"),
+        (1, "connecting"),
+        (2, "connecting"),
+    ]
 
 
 def test_guilds_are_counted_per_shard() -> None:

@@ -12,7 +12,9 @@ from typing import Any
 import discord
 import pytest
 from discord.ext import commands
+from discord.shard import ShardInfo
 
+from conftest import FakeClient
 from thediscordlist import autopost
 from thediscordlist._topology import collect_shards, detect_topology
 
@@ -49,6 +51,15 @@ def test_a_real_auto_sharded_client_reports_every_declared_shard(
 
     # No shards exist before launch; the declared ids stand in as "connecting".
     assert [s["id"] for s in collect_shards(client, topology)] == [0, 1, 2, 3]
+
+
+def test_a_real_shard_with_a_closed_socket_reads_as_connecting() -> None:
+    class Parent:
+        id = 0
+        ws = type("Socket", (), {"open": False, "latency": 0.05})()
+
+    client = FakeClient(shard_count=1, shards={0: ShardInfo(Parent(), 1)})  # type: ignore[arg-type,dict-item]
+    assert collect_shards(client, detect_topology(client))[0]["status"] == "connecting"
 
 
 def test_a_real_subset_of_shards_withholds_the_cluster_count(

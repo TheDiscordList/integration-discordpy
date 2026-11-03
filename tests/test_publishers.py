@@ -235,12 +235,11 @@ async def test_a_configured_cadence_is_clamped_before_the_first_beat(
     assert heartbeat._interval == expected
 
 
-async def test_heartbeat_skips_a_beat_with_no_shards_to_report() -> None:
-    client = FakeClient(shard_count=2, shards={})
-    api = FakeApi()
-    deps = make_deps(client, api)
-    object.__setattr__(deps.topology, "shard_ids", ())
-    heartbeat = HeartbeatPublisher(deps)
+async def test_heartbeat_skips_a_beat_with_no_shards_to_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("thediscordlist._publishers.collect_shards", lambda *_: [])
+    heartbeat = HeartbeatPublisher(make_deps(FakeClient(shard_count=2, shards={}), FakeApi()))
 
     assert (await heartbeat.post()).skipped == "no-shards"
 
