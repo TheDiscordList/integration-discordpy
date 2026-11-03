@@ -471,7 +471,9 @@ class CommandsPublisher(Publisher):
             if not raw and not self._post_empty:
                 return PostResult(False, None, "empty")
 
-            return await self._send(f"/bots/{self._d.bot_id}/commands", {"commands": raw})
+            return await self._send(
+                f"/bots/{self._d.bot_id}/commands", {"commands": raw}, next_tick=COMMANDS_RETRY
+            )
 
 
 def _worth_retrying(result: PostResult) -> bool:

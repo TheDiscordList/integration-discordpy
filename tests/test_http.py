@@ -323,3 +323,18 @@ async def test_close_during_a_manual_post_ends_publishing_for_good(
     assert len(server.requests) == 2
     assert poster._stats._task is None
     assert client._session is None
+
+
+async def test_a_commands_429_that_outlasts_the_retry_answers_at_once(
+    server: Server, make_client: Callable[[], ApiClient]
+) -> None:
+    """Waited out inside the post, it would hold the lock a manual post_commands() needs."""
+    server.reply(web.json_response({}, status=429, headers={"retry-after": "3600"}))
+    client = FakeClient(commands=[{"name": "ping"}])
+    poster = Autoposter(client, make_client(), stats=False, heartbeat=False)
+    poster.start()
+
+    result = await asyncio.wait_for(poster.post_commands(), 5)
+    await poster.close()
+
+    assert result == PostResult(False, 429, "throttled")
