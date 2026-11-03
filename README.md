@@ -124,7 +124,8 @@ autopost(
 )
 ```
 
-or set `TDL_CLUSTER` and `TDL_CLUSTER_COUNT` in each process's environment.
+or set `TDL_CLUSTER` and `TDL_CLUSTER_COUNT` in each process's environment. Only
+cluster 0 asks `server_count` and posts stats and commands.
 
 Two things are deliberately switched off when a process cannot work them out:
 

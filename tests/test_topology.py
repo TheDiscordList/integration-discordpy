@@ -179,6 +179,19 @@ async def test_the_callback_wins_and_may_be_async() -> None:
     assert await measure_server_count(client, topology, lambda: 99) == 99
 
 
+async def test_the_callback_is_not_asked_on_a_process_that_is_not_elected() -> None:
+    client = FakeClient(guilds=7, shard_count=8, shard_ids=[2, 3])
+    asked = False
+
+    def total() -> int:
+        nonlocal asked
+        asked = True
+        return 4321
+
+    assert await measure_server_count(client, detect_topology(client), total) is None
+    assert not asked
+
+
 async def test_a_broken_callback_yields_no_count_rather_than_a_wrong_one() -> None:
     client = FakeClient()
     topology = detect_topology(client)

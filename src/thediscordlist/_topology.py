@@ -183,6 +183,11 @@ async def measure_server_count(
     what a bot list wants -- and does not drain during a Discord outage, so a
     local read needs no sanity backstop.
     """
+    # Before the callback too: every cluster posting at +5s burns the per-bot
+    # budget, and cluster 0's commands post gets suspended along with them.
+    if not topology.is_stats_publisher:
+        return None
+
     if server_count is not None:
         try:
             value = server_count()
