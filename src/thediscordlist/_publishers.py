@@ -217,7 +217,7 @@ class Publisher:
         was_disabled = self._disabled is not None
         self._rearm()
         result = await post()
-        if was_disabled and self._disabled is None:
+        if was_disabled and self._disabled is None and not self._d.api.closed:
             self.start()
         return result
 

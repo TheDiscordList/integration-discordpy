@@ -6,6 +6,7 @@ the headers and the body draining for real, and costs about ten lines.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import AsyncIterator, Callable
 from typing import Any
@@ -13,7 +14,10 @@ from typing import Any
 import pytest
 from aiohttp import web
 
+from conftest import FakeClient
+from thediscordlist import Autoposter
 from thediscordlist._http import ApiClient, backoff
+from thediscordlist._publishers import PostResult
 
 
 class Server:
@@ -292,3 +296,30 @@ async def test_a_429_never_suspends_for_more_than_an_hour(
     await client.close()
 
     assert 3590 < remaining <= 3602
+
+
+async def test_close_during_a_manual_post_ends_publishing_for_good(
+    server: Server, make_client: Callable[[], ApiClient], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A loop restarted after close() would keep posting in a process that stays alive."""
+    closing: list[asyncio.Task[None]] = []
+
+    def close_during_the_retry_wait(_: int) -> float:
+        closing.append(asyncio.create_task(poster.close()))
+        return 0.01
+
+    monkeypatch.setattr("thediscordlist._publishers.STATS_MIN_GAP", 0.0)
+    monkeypatch.setattr("thediscordlist._http.backoff", close_during_the_retry_wait)
+    server.reply(web.Response(status=404), web.Response(status=503))
+    client = make_client()
+    poster = Autoposter(FakeClient(), client, heartbeat=False, commands=False)
+    poster.start()
+    assert poster._stats is not None
+    assert (await poster.post_stats()).status == 404
+
+    await poster.post_stats()
+    await asyncio.gather(*closing)
+
+    assert len(server.requests) == 2
+    assert poster._stats._task is None
+    assert client._session is None

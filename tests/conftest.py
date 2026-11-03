@@ -99,6 +99,7 @@ class FakeApi:
         self.queue = list(outcomes)
         self.default = Outcome("ok", 200, {})
         self.calls: list[tuple[str, Any, bool]] = []
+        self.closed = False
 
     async def post(
         self, path: str, body: Any, *, heartbeat: bool = False, next_tick: float | None = None
@@ -107,7 +108,7 @@ class FakeApi:
         return self.queue.pop(0) if self.queue else self.default
 
     async def close(self) -> None:
-        return None
+        self.closed = True
 
     @property
     def bodies(self) -> list[Any]:

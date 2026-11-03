@@ -96,6 +96,7 @@ class ApiClient:
         self._base_url = base_url.rstrip("/")
         self._headers = {"authorization": f"Bearer {token}", "user-agent": user_agent}
         self._session: aiohttp.ClientSession | None = None
+        self.closed = False
         # Instance state, never module state: two Autoposters in one process must
         # not share a budget.
         self._rate_limited_until = 0.0
@@ -137,7 +138,7 @@ class ApiClient:
         return outcome
 
     async def _once(self, path: str, body: Any, heartbeat: bool, *, ignore_limit: bool) -> Outcome:
-        if not ignore_limit and time.monotonic() < self._rate_limited_until:
+        if self.closed or (not ignore_limit and time.monotonic() < self._rate_limited_until):
             return Outcome("dropped")
 
         if self._session is None or self._session.closed:
@@ -177,6 +178,7 @@ class ApiClient:
         return outcome
 
     async def close(self) -> None:
+        self.closed = True
         if self._session is not None and not self._session.closed:
             await self._session.close()
         self._session = None
