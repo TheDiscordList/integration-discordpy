@@ -49,6 +49,17 @@ async def test_stats_posts_the_count_and_always_sends_shard_count() -> None:
     assert api.bodies[0] == {"server_count": 42, "shard_count": 4}
 
 
+async def test_stats_sends_the_shard_count_an_auto_sharded_client_learned_after_setup() -> None:
+    client = FakeClient(guilds=42, shards={})
+    api = FakeApi()
+    stats = StatsPublisher(make_deps(client, api))
+
+    client.shard_count = 4  # what launch_shards() sets, after setup_hook
+    await stats.post()
+
+    assert api.bodies[0]["shard_count"] == 4
+
+
 @pytest.mark.usefixtures("no_min_gap")
 async def test_stats_skips_an_unchanged_count() -> None:
     """Every post re-indexes the listing and fires a webhook, even unchanged."""

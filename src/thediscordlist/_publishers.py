@@ -283,7 +283,11 @@ class StatsPublisher(Publisher):
             if count is None:
                 return PostResult(False, None, "not-elected")
 
-            shard_count = self._d.topology.shard_count
+            # Read live: an auto-sharded client only learns its count after setup_hook,
+            # which is when the topology was detected.
+            shard_count = (
+                getattr(self._d.client, "shard_count", None) or self._d.topology.shard_count
+            )
             if self._last == (count, shard_count) and now - self._last_post_at < STATS_FORCE_AFTER:
                 return PostResult(False, None, "unchanged")
 
