@@ -79,7 +79,7 @@ def test_a_real_client_reports_a_usable_shard_before_login(intents: discord.Inte
 
     assert entry["id"] == 0
     assert entry["status"] == "connecting"
-    assert entry["guilds"] == 0
+    assert "guilds" not in entry
     # `Client.latency` is nan without a websocket, and the API minimum is 0.
     assert "latency_ms" not in entry
 

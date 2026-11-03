@@ -113,6 +113,19 @@ def test_shards_not_launched_yet_report_connecting() -> None:
     ]
 
 
+def test_guilds_are_omitted_until_a_shard_is_ready() -> None:
+    """A restart's first `connecting` beat would otherwise zero the public count."""
+    client = FakeClient(guilds=5, ready=False)
+    assert "guilds" not in collect_shards(client, detect_topology(client))[0]
+
+    mid_reconnect = FakeClient(
+        guilds=5, shard_count=2, shards={0: FakeShard(0), 1: FakeShard(1, closed=True)}
+    )
+    ready, reconnecting = collect_shards(mid_reconnect, detect_topology(mid_reconnect))
+    assert "guilds" in ready
+    assert "guilds" not in reconnecting
+
+
 def test_guilds_are_counted_per_shard() -> None:
     client = FakeClient(guilds=20, shard_count=2, shards={0: FakeShard(0), 1: FakeShard(1)})
     shards = collect_shards(client, detect_topology(client))

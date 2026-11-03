@@ -124,11 +124,12 @@ def _status(closed: bool, ready: bool) -> ShardStatus:
 def _shard_entry(
     shard_id: int, latency: float, closed: bool, ready: bool, guilds: int
 ) -> dict[str, Any]:
-    entry: dict[str, Any] = {
-        "id": shard_id,
-        "status": _status(closed, ready),
-        "guilds": guilds,
-    }
+    status = _status(closed, ready)
+    entry: dict[str, Any] = {"id": shard_id, "status": status}
+    # A shard that is not ready counts 0 guilds, and the server would take that
+    # for the bot's public count. A missing key reads as "unknown" instead.
+    if status == "ready":
+        entry["guilds"] = guilds
     # discord.py reports `inf` (or `nan`) before the first HEARTBEAT_ACK, and the
     # API minimum is 0, so the key is omitted rather than sent nonsense.
     if math.isfinite(latency) and latency >= 0:
