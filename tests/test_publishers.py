@@ -194,6 +194,26 @@ async def test_heartbeat_reports_this_process_only() -> None:
     assert api.calls[0][2] is True  # sent with heartbeat priority
 
 
+async def test_a_shard_state_change_beats_out_of_band_at_most_once_per_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("thediscordlist._publishers.HEARTBEAT_OUT_OF_BAND_GAP", 0.1)
+    monkeypatch.setattr("thediscordlist._publishers.HEARTBEAT_OUT_OF_BAND_DELAY", 0.01)
+    heartbeat = HeartbeatPublisher(make_deps(FakeClient(), FakeApi()))
+    await heartbeat.post()
+
+    started = time.monotonic()
+    waiting = asyncio.create_task(heartbeat._wait(60))
+    await asyncio.sleep(0)
+    heartbeat.beat_now()
+    await asyncio.sleep(0.01)
+    heartbeat.beat_now()  # a burst, while the first is still settling
+    await asyncio.wait_for(waiting, 1)
+
+    assert 0.05 < time.monotonic() - started < 1
+    assert not heartbeat._changed.is_set()
+
+
 async def test_heartbeat_refuses_to_start_without_a_cluster_count(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

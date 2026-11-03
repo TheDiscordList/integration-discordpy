@@ -35,6 +35,9 @@ HEARTBEAT_DEFAULT_INTERVAL = 30.0
 HEARTBEAT_MIN_INTERVAL = 15.0
 HEARTBEAT_MAX_INTERVAL = 60.0
 HEARTBEAT_JITTER = 5.0
+#: An out-of-band beat never follows the previous beat more closely than this.
+HEARTBEAT_OUT_OF_BAND_GAP = 10.0
+HEARTBEAT_OUT_OF_BAND_DELAY = 1.0
 
 #: Offset from the first stats post: the two share one server-side rate budget.
 COMMANDS_DELAY = 10.0
@@ -78,6 +81,7 @@ class Publisher:
         self._disabled: str | None = None
         self._suspended_until = 0.0
         self._reported: set[int] = set()
+        self._changed = asyncio.Event()
 
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -99,6 +103,14 @@ class Publisher:
 
     async def _wait(self, delay: float) -> None:
         await asyncio.sleep(delay)
+
+    async def _changed_within(self, seconds: float) -> bool:
+        try:
+            await asyncio.wait_for(self._changed.wait(), seconds)
+        except asyncio.TimeoutError:
+            return False
+        self._changed.clear()
+        return True
 
     async def _guarded(self) -> None:
         try:
@@ -240,7 +252,6 @@ class StatsPublisher(Publisher):
         self._server_count = server_count
         self._last_post_at = 0.0
         self._last: tuple[int, int] | None = None
-        self._changed = asyncio.Event()
 
     async def _prime(self) -> None:
         await self._d.client.wait_until_ready()
@@ -267,14 +278,6 @@ class StatsPublisher(Publisher):
             min(STATS_DEBOUNCE, left)
         ):
             pass
-
-    async def _changed_within(self, seconds: float) -> bool:
-        try:
-            await asyncio.wait_for(self._changed.wait(), seconds)
-        except asyncio.TimeoutError:
-            return False
-        self._changed.clear()
-        return True
 
     async def post(self) -> PostResult:
         return await self._rearmed(lambda: self._publish(manual=True))
@@ -329,6 +332,7 @@ class HeartbeatPublisher(Publisher):
     def __init__(self, deps: Deps, interval: float = HEARTBEAT_DEFAULT_INTERVAL) -> None:
         super().__init__(deps)
         self._interval = _clamp_heartbeat(interval)
+        self._last_beat_at = 0.0
 
     def start(self) -> None:
         # Every beat hard-deletes the listing's cluster rows whose
@@ -352,6 +356,20 @@ class HeartbeatPublisher(Publisher):
         # Jitter de-locksteps N cluster processes that all started from one deploy.
         return delay + random.uniform(0.0, HEARTBEAT_JITTER)
 
+    def beat_now(self) -> None:
+        """Out-of-band beat after a shard state change. Calls before it fires coalesce into one."""
+        self._changed.set()
+
+    async def _wait(self, delay: float) -> None:
+        """A 30s cadence against a 90s grace leaves no margin during a reconnect."""
+        deadline = time.monotonic() + delay
+        if not await self._changed_within(delay):
+            return
+        now = time.monotonic()
+        gap = self._last_beat_at + HEARTBEAT_OUT_OF_BAND_GAP - now
+        await asyncio.sleep(min(max(gap, HEARTBEAT_OUT_OF_BAND_DELAY), deadline - now))
+        self._changed.clear()
+
     async def post(self) -> PostResult:
         return await self._rearmed(lambda: self._beat(manual=True))
 
@@ -369,6 +387,7 @@ class HeartbeatPublisher(Publisher):
             if not shards:  # the API requires at least one entry
                 return PostResult(False, None, "no-shards")
 
+            self._last_beat_at = time.monotonic()
             return await self._send(
                 f"/bots/{self._d.bot_id}/heartbeat",
                 {

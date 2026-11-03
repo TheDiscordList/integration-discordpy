@@ -38,7 +38,7 @@ Get the token from your bot's manage page → **API** tab.
 | | Endpoint | When |
 | --- | --- | --- |
 | **Stats** | `POST /bots/{id}/stats` | the guild count is checked every 5 minutes and shortly after a guild join or removal, and posted when it moves, plus every 30 minutes regardless |
-| **Heartbeat** | `POST /bots/{id}/heartbeat` | every ~30s per process, starting before the gateway connects so a booting bot reads *connecting* rather than *down* |
+| **Heartbeat** | `POST /bots/{id}/heartbeat` | every ~30s per process, plus soon after a shard changes state, starting before the gateway connects so a booting bot reads *connecting* rather than *down* |
 | **Commands** | `POST /bots/{id}/commands` | once, ~10s after ready, and every 5 minutes after that if it fails — commands change on deploy, and a deploy is a restart |
 
 ### Defaults
@@ -47,7 +47,8 @@ Get the token from your bot's manage page → **API** tab.
   removal. Never two posts within 60s. An unchanged count is skipped until
   30 minutes have passed.
 - **Heartbeat:** every 30s plus 0–5s of jitter, retuned from each response to a
-  third of the server's grace window and kept within 15–60s.
+  third of the server's grace window and kept within 15–60s. A shard state
+  change beats out of band, at least 10s after the previous beat.
 - **Commands:** once, 10s after ready. A `5xx`, a network error, a rate-limit
   suspension or a failed fetch from Discord tries again every 5 minutes, until
   it succeeds or gets a `4xx` that retrying cannot fix.
