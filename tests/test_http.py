@@ -173,6 +173,28 @@ async def test_a_429_suspends_normal_traffic_but_never_heartbeats(
     assert len(server.requests) == 2  # the dropped post never left the process
 
 
+async def test_a_heartbeat_429_leaves_stats_alone_and_waits_out_its_own_window(
+    server: Server, make_client: Callable[[], ApiClient], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("thediscordlist._http.random.uniform", lambda a, b: 0.0)
+    server.reply(
+        web.json_response({}, status=429, headers={"retry-after": "30"}),
+        web.json_response({"ok": True}),
+        web.json_response({}, status=429, headers={"retry-after": "0.1"}),
+    )
+    client = make_client()
+
+    assert (await client.post("/bots/1/heartbeat", {}, heartbeat=True, next_tick=1)).status == 429
+    assert (await client.post("/bots/1/stats", {})).kind == "ok"
+
+    started = time.monotonic()
+    assert (await client.post("/bots/1/heartbeat", {}, heartbeat=True, next_tick=600)).kind == "ok"
+    await client.close()
+
+    assert time.monotonic() - started >= 0.05  # not at once, allowing for a coarse clock
+    assert len(server.requests) == 4
+
+
 async def test_a_connection_failure_is_transient_not_a_crash() -> None:
     client = ApiClient("tok", "http://127.0.0.1:1/api", "tests/1.0")
     outcome = await client.post("/bots/1/stats", {}, next_tick=0.0001)
