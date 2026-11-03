@@ -190,6 +190,21 @@ async def test_asgi_rejects_a_stale_delivery_with_400() -> None:
     assert status == 400
 
 
+async def test_asgi_rejects_a_header_that_is_not_utf8_instead_of_raising() -> None:
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": BODY.encode(), "more_body": False}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    scope = {"type": "http", "method": "POST", "headers": [(b"x-tdl-signature", b"t=\xff")]}
+    await asgi_webhook_app(SECRET, lambda *_: None)(scope, receive, send)
+
+    assert sent[0]["status"] == 400
+
+
 async def test_asgi_answers_405_to_anything_but_post() -> None:
     app = asgi_webhook_app(SECRET, lambda event, ctx: None)
     status, _ = await call_asgi(app, b"", {}, method="GET")

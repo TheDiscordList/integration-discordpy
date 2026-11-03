@@ -441,7 +441,11 @@ def asgi_webhook_app(
                 await _send_status(send, 413)
                 return
 
-        headers = {key.decode().lower(): value.decode() for key, value in scope["headers"]}
+        # ASGI header bytes are latin-1, and any client can send one that is not UTF-8.
+        headers = {
+            key.decode("latin-1").lower(): value.decode("latin-1")
+            for key, value in scope["headers"]
+        }
         await _send_status(send, await _dispatch(options, bytes(raw), headers))
 
     return app
