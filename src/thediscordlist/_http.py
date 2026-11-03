@@ -27,6 +27,9 @@ TIMEOUT_SECONDS = 10.0
 MAX_ATTEMPTS = 3
 #: However far out Retry-After or X-RateLimit-Reset points, never go quiet for longer.
 MAX_RATE_LIMIT_WAIT = 3600.0
+#: When a 429 carries no usable Retry-After.
+RATE_LIMIT_DEFAULT = 60.0
+RATE_LIMIT_JITTER = 2.0
 
 OutcomeKind = Literal[
     "ok",  # 2xx
@@ -71,7 +74,7 @@ def _classify(status: int, body: Any, retry_after: str | None) -> Outcome:
     if status in (404, 409):
         return Outcome("config", status)
     if status == 429:
-        return Outcome("throttled", 429, retry_after=_seconds(retry_after) or 60.0)
+        return Outcome("throttled", 429, retry_after=_seconds(retry_after) or RATE_LIMIT_DEFAULT)
     # Retrying the same request cannot turn any other 4xx into a success.
     if 400 <= status < 500 and status not in (408, 425):
         return Outcome("payload", status, body)
@@ -163,7 +166,9 @@ class ApiClient:
             reset = _seconds(headers.get("x-ratelimit-reset"))
             until = max(outcome.retry_after, reset - time.time() if reset else 0.0)
             limited_until = (
-                time.monotonic() + min(until, MAX_RATE_LIMIT_WAIT) + random.uniform(0.0, 2.0)
+                time.monotonic()
+                + min(until, MAX_RATE_LIMIT_WAIT)
+                + random.uniform(0.0, RATE_LIMIT_JITTER)
             )
             if heartbeat:
                 self._heartbeat_limited_until = limited_until
