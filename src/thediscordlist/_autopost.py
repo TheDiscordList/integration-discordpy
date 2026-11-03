@@ -29,6 +29,11 @@ __all__ = ["Autoposter", "autopost"]
 
 _DISABLED = PostResult(False, None, "disabled")
 
+_GUILD_EVENTS = ("on_guild_join", "on_guild_remove")
+#: The `on_connect`, `on_resumed` and `on_disconnect` forms fire for auto-sharded
+#: clients too, but `on_ready` only once, so a re-identified shard needs its own.
+_SHARD_EVENTS = ("on_connect", "on_ready", "on_shard_ready", "on_resumed", "on_disconnect")
+
 
 class AutopostOptions(TypedDict, total=False):
     """The keyword options of :func:`autopost`. Defaults live in :class:`Autoposter`."""
@@ -136,10 +141,11 @@ class Autoposter:
         if self._want["stats"]:
             self._stats = StatsPublisher(deps, self._stats_interval, self._server_count)
             self._stats.start()
-            _on_guild_change(self._client, self._stats.on_guild_change)
+            _on_events(self._client, _GUILD_EVENTS, self._stats.on_guild_change)
         if self._want["heartbeat"]:
             self._heartbeat = HeartbeatPublisher(deps, self._heartbeat_interval)
             self._heartbeat.start()
+            _on_events(self._client, _SHARD_EVENTS, self._heartbeat.beat_now)
         if self._want["commands"]:
             self._commands = CommandsPublisher(deps, self._post_empty_commands)
             self._commands.start()
@@ -262,13 +268,13 @@ def _wire(client: Any, poster: Autoposter) -> None:
     client.close = close
 
 
-def _on_guild_change(client: Any, callback: Callable[[], None]) -> None:
-    """Runs ``callback`` on every guild join and removal, beside the user's own handlers."""
+def _on_events(client: Any, events: tuple[str, ...], callback: Callable[[], None]) -> None:
+    """Runs ``callback`` on each of ``events``, beside the user's own handlers."""
 
     async def listener(*_: Any) -> None:
         callback()
 
-    for event in ("on_guild_join", "on_guild_remove"):
+    for event in events:
         if hasattr(client, "add_listener"):  # commands.Bot
             client.add_listener(listener, event)
             continue

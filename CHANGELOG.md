@@ -1,5 +1,22 @@
 # thediscordlist
 
+## 0.2.1
+
+### Patch Changes
+
+- ece4b51: An auto-sharded bot no longer reports a reconnecting shard as `disconnected`, which opened a public Down incident on its status page. Only a closed client reports it now, and a shard not launched yet or mid-reconnect reports `connecting`.
+- 5ddceee: A shard that is not ready leaves `guilds` out of its heartbeat entry, so a restart's first beat can no longer zero the public server count.
+- 8e63a1c: `AutoShardedBot` reports its real `shard_count` instead of 1, which was read in `setup_hook` before discord.py knew it.
+- b70fde9: A commands post that fails on a `5xx`, a network error, a rate limit or a Discord fetch tries again every 5 minutes until it lands or gets a `4xx` retrying cannot fix.
+- 4f5efe5: `server_count` only runs on the elected publisher, so a large bot no longer exhausts its rate limit at startup with every cluster posting at once.
+- 908ea64: A heartbeat `429` no longer suspends stats and commands, which have a limit of their own.
+- 0f563e4: After a `404`, a successful `post_stats()` or `post_heartbeat()` restarts its publisher loop, instead of working once and going stale.
+- cf76862: A shard state change sends a heartbeat soon after, at least 10 seconds after the previous one, as the other SDKs do.
+- f54d12f: A response body that is not UTF-8 is a transient failure rather than an exception, a webhook timestamp too large for a float is rejected as stale, and `asgi_webhook_app` no longer raises on a header that is not UTF-8.
+- 4ad94c3: `close()` landing during a manual post no longer reopens the HTTP session or restarts a publisher loop, which went on posting for as long as the process lived.
+- 18f83e9: A commands `429` that outlasts the 5-minute retry answers at once and tries again in 5 minutes, instead of holding `post_commands()` for up to an hour.
+- 113577e: A `post_commands()` that lands ends a pending retry, which would only post the same list again.
+
 ## 0.2.0
 
 ### Minor Changes

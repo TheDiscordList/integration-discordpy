@@ -1,10 +1,10 @@
 """The one HTTP client every publisher shares.
 
 There is a single client-side suspension rather than one per endpoint, because
-the server counts stats and commands against one per-bot budget. Heartbeats
-bypass it: a dropped stats post
-is a stale number, a dropped heartbeat is a false "down" on the user's public
-status page.
+the server counts stats and commands against one per-bot budget. Heartbeats have
+a limiter of their own, so their 429 leaves it alone, and they bypass it: a
+dropped stats post is a stale number, a dropped heartbeat is a false "down" on
+the user's public status page.
 """
 
 from __future__ import annotations
@@ -27,6 +27,9 @@ TIMEOUT_SECONDS = 10.0
 MAX_ATTEMPTS = 3
 #: However far out Retry-After or X-RateLimit-Reset points, never go quiet for longer.
 MAX_RATE_LIMIT_WAIT = 3600.0
+#: When a 429 carries no usable Retry-After.
+RATE_LIMIT_DEFAULT = 60.0
+RATE_LIMIT_JITTER = 2.0
 
 OutcomeKind = Literal[
     "ok",  # 2xx
@@ -71,7 +74,7 @@ def _classify(status: int, body: Any, retry_after: str | None) -> Outcome:
     if status in (404, 409):
         return Outcome("config", status)
     if status == 429:
-        return Outcome("throttled", 429, retry_after=_seconds(retry_after) or 60.0)
+        return Outcome("throttled", 429, retry_after=_seconds(retry_after) or RATE_LIMIT_DEFAULT)
     # Retrying the same request cannot turn any other 4xx into a success.
     if 400 <= status < 500 and status not in (408, 425):
         return Outcome("payload", status, body)
@@ -93,9 +96,11 @@ class ApiClient:
         self._base_url = base_url.rstrip("/")
         self._headers = {"authorization": f"Bearer {token}", "user-agent": user_agent}
         self._session: aiohttp.ClientSession | None = None
+        self.closed = False
         # Instance state, never module state: two Autoposters in one process must
         # not share a budget.
         self._rate_limited_until = 0.0
+        self._heartbeat_limited_until = 0.0
 
     async def post(
         self,
@@ -115,11 +120,16 @@ class ApiClient:
         for attempt in range(MAX_ATTEMPTS):
             # A request that just waited out the window goes through it, even
             # if the loop wakes a clock tick early.
-            outcome = await self._once(path, body, heartbeat or outcome.kind == "throttled")
+            outcome = await self._once(
+                path, body, heartbeat, ignore_limit=heartbeat or outcome.kind == "throttled"
+            )
             if outcome.kind == "transient":
                 delay = backoff(attempt)
             elif outcome.kind == "throttled":
-                delay = self._rate_limited_until - time.monotonic()
+                limited_until = (
+                    self._heartbeat_limited_until if heartbeat else self._rate_limited_until
+                )
+                delay = limited_until - time.monotonic()
             else:
                 break
             if attempt == MAX_ATTEMPTS - 1 or (next_tick is not None and delay >= next_tick):
@@ -127,8 +137,8 @@ class ApiClient:
             await asyncio.sleep(delay)
         return outcome
 
-    async def _once(self, path: str, body: Any, ignore_limit: bool) -> Outcome:
-        if not ignore_limit and time.monotonic() < self._rate_limited_until:
+    async def _once(self, path: str, body: Any, heartbeat: bool, *, ignore_limit: bool) -> Outcome:
+        if self.closed or (not ignore_limit and time.monotonic() < self._rate_limited_until):
             return Outcome("dropped")
 
         if self._session is None or self._session.closed:
@@ -141,7 +151,8 @@ class ApiClient:
             async with self._session.post(f"{self._base_url}{path}", json=body) as response:
                 # Always read the body inside the context manager, or the
                 # connection is returned to the pool unread.
-                text = await response.text()
+                # A proxy's error page need not be UTF-8, and this client never raises.
+                text = await response.text(errors="replace")
                 status, headers = response.status, response.headers
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as error:
             return Outcome("transient", error=error)
@@ -155,12 +166,19 @@ class ApiClient:
         if outcome.kind == "throttled":
             reset = _seconds(headers.get("x-ratelimit-reset"))
             until = max(outcome.retry_after, reset - time.time() if reset else 0.0)
-            self._rate_limited_until = (
-                time.monotonic() + min(until, MAX_RATE_LIMIT_WAIT) + random.uniform(0.0, 2.0)
+            limited_until = (
+                time.monotonic()
+                + min(until, MAX_RATE_LIMIT_WAIT)
+                + random.uniform(0.0, RATE_LIMIT_JITTER)
             )
+            if heartbeat:
+                self._heartbeat_limited_until = limited_until
+            else:
+                self._rate_limited_until = limited_until
         return outcome
 
     async def close(self) -> None:
+        self.closed = True
         if self._session is not None and not self._session.closed:
             await self._session.close()
         self._session = None

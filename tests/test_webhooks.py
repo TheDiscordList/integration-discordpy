@@ -96,6 +96,7 @@ def test_a_handler_refuses_to_start_without_a_secret(factory: Any) -> None:
         (BODY.replace("42", "43"), sign(), "INVALID_SIGNATURE"),
         (BODY, sign(t=int(NOW) - 301), "STALE_TIMESTAMP"),
         (BODY, sign(t=int(NOW) + 301), "STALE_TIMESTAMP"),
+        (BODY, f"t={'9' * 400},v1={'a' * 64}", "STALE_TIMESTAMP"),
         (BODY, "v1=deadbeef", "MALFORMED_SIGNATURE"),
         (BODY, f"t={int(NOW)}", "MALFORMED_SIGNATURE"),
         (BODY, f"t=not-a-number,v1={'a' * 64}", "MALFORMED_SIGNATURE"),
@@ -187,6 +188,21 @@ async def test_asgi_rejects_a_stale_delivery_with_400() -> None:
     app = asgi_webhook_app(SECRET, lambda event, ctx: None, tolerance_seconds=0)
     status, _ = await call_asgi(app, BODY.encode(), {"x-tdl-signature": sign(t=1)})
     assert status == 400
+
+
+async def test_asgi_rejects_a_header_that_is_not_utf8_instead_of_raising() -> None:
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": BODY.encode(), "more_body": False}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    scope = {"type": "http", "method": "POST", "headers": [(b"x-tdl-signature", b"t=\xff")]}
+    await asgi_webhook_app(SECRET, lambda *_: None)(scope, receive, send)
+
+    assert sent[0]["status"] == 400
 
 
 async def test_asgi_answers_405_to_anything_but_post() -> None:

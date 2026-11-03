@@ -259,8 +259,9 @@ def verify_webhook(
 
     # Two-sided, so a sender skewed into the future is caught too. Checked against
     # `t`, never `created_at` -- that is stamped at enqueue time and can be over
-    # an hour older on a retry.
-    if abs(now() - timestamp) > tolerance_seconds:
+    # an hour older on a retry. Whole seconds, as a `t` too large for a float would
+    # otherwise raise OverflowError instead of being rejected.
+    if abs(int(now()) - timestamp) > tolerance_seconds:
         raise WebhookError("STALE_TIMESTAMP", "Webhook timestamp outside the tolerance window.")
 
     raw = raw_body.encode() if isinstance(raw_body, str) else bytes(raw_body)
@@ -440,7 +441,11 @@ def asgi_webhook_app(
                 await _send_status(send, 413)
                 return
 
-        headers = {key.decode().lower(): value.decode() for key, value in scope["headers"]}
+        # ASGI header bytes are latin-1, and any client can send one that is not UTF-8.
+        headers = {
+            key.decode("latin-1").lower(): value.decode("latin-1")
+            for key, value in scope["headers"]
+        }
         await _send_status(send, await _dispatch(options, bytes(raw), headers))
 
     return app

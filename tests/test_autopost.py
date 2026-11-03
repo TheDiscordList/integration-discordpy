@@ -73,6 +73,24 @@ async def test_a_guild_change_wakes_stats_beside_the_users_own_handler() -> None
     await poster.close()
 
 
+async def test_a_gateway_event_wakes_the_heartbeat_beside_the_users_own_handler() -> None:
+    client = FakeClient()
+    seen: list[str] = []
+
+    async def on_disconnect() -> None:
+        seen.append("disconnect")
+
+    client.on_disconnect = on_disconnect  # type: ignore[attr-defined]
+    poster = Autoposter(client, FakeApi())  # type: ignore[arg-type]
+    poster.start()
+    assert poster._heartbeat is not None
+
+    await client.on_disconnect()  # type: ignore[attr-defined]
+    assert seen == ["disconnect"]
+    assert poster._heartbeat._changed.is_set()
+    await poster.close()
+
+
 async def test_it_starts_immediately_when_the_client_is_already_logged_in() -> None:
     client = FakeClient()
     poster = autopost(client, "tok", base_url=DEAD, commands=False)
