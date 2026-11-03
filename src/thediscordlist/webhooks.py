@@ -259,8 +259,9 @@ def verify_webhook(
 
     # Two-sided, so a sender skewed into the future is caught too. Checked against
     # `t`, never `created_at` -- that is stamped at enqueue time and can be over
-    # an hour older on a retry.
-    if abs(now() - timestamp) > tolerance_seconds:
+    # an hour older on a retry. Whole seconds, as a `t` too large for a float would
+    # otherwise raise OverflowError instead of being rejected.
+    if abs(int(now()) - timestamp) > tolerance_seconds:
         raise WebhookError("STALE_TIMESTAMP", "Webhook timestamp outside the tolerance window.")
 
     raw = raw_body.encode() if isinstance(raw_body, str) else bytes(raw_body)

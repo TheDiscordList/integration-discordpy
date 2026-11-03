@@ -96,6 +96,7 @@ def test_a_handler_refuses_to_start_without_a_secret(factory: Any) -> None:
         (BODY.replace("42", "43"), sign(), "INVALID_SIGNATURE"),
         (BODY, sign(t=int(NOW) - 301), "STALE_TIMESTAMP"),
         (BODY, sign(t=int(NOW) + 301), "STALE_TIMESTAMP"),
+        (BODY, f"t={'9' * 400},v1={'a' * 64}", "STALE_TIMESTAMP"),
         (BODY, "v1=deadbeef", "MALFORMED_SIGNATURE"),
         (BODY, f"t={int(NOW)}", "MALFORMED_SIGNATURE"),
         (BODY, f"t=not-a-number,v1={'a' * 64}", "MALFORMED_SIGNATURE"),
