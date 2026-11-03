@@ -225,10 +225,9 @@ class Publisher:
 class StatsPublisher(Publisher):
     """Posts the guild count when it moves: on a timer, and shortly after a guild change.
 
-    The unchanged-value skip matters more than it looks -- every ``/stats``
-    post re-indexes the listing, evaluates achievements and fires a
-    ``bot.stats_reported`` webhook even when the number did not move, and there
-    is no server-side dedupe.
+    The server keeps an unchanged count from re-indexing or firing a webhook,
+    but the request still spends the budget stats and commands share, so the
+    unchanged-value skip stays.
     """
 
     kind: PublisherKind = "stats"

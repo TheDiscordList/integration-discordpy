@@ -63,7 +63,7 @@ async def test_stats_sends_the_shard_count_an_auto_sharded_client_learned_after_
 
 @pytest.mark.usefixtures("no_min_gap")
 async def test_stats_skips_an_unchanged_count() -> None:
-    """Every post re-indexes the listing and fires a webhook, even unchanged."""
+    """An unchanged post has no side effects, but still spends the shared budget."""
     client = FakeClient(guilds=42)
     api = FakeApi()
     stats = StatsPublisher(make_deps(client, api))
