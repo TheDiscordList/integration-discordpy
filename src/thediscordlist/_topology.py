@@ -125,11 +125,12 @@ def _status(closed: bool, ready: bool) -> ShardStatus:
 def _shard_entry(
     shard_id: int, latency: float, closed: bool, ready: bool, guilds: int
 ) -> dict[str, Any]:
-    entry: dict[str, Any] = {
-        "id": shard_id,
-        "status": _status(closed, ready),
-        "guilds": guilds,
-    }
+    status = _status(closed, ready)
+    entry: dict[str, Any] = {"id": shard_id, "status": status}
+    # A shard that is not ready counts 0 guilds, and the server would take that
+    # for the bot's public count. A missing key reads as "unknown" instead.
+    if status == "ready":
+        entry["guilds"] = guilds
     # discord.py reports `inf` (or `nan`) before the first HEARTBEAT_ACK, and the
     # API minimum is 0, so the key is omitted rather than sent nonsense.
     if math.isfinite(latency) and latency >= 0:
@@ -140,38 +141,34 @@ def _shard_entry(
 def collect_shards(client: Any, topology: Topology) -> list[dict[str, Any]]:
     """One entry per shard this process owns, in the API's shape.
 
-    Before the gateway connects, `AutoShardedClient.shards` is empty; the
-    declared ids are reported as `connecting` instead, so a booting bot reads
-    as booting rather than vanishing from its own status page.
+    `AutoShardedClient.shards` only holds what has launched so far, and is empty
+    before the gateway connects; the other declared ids are reported as
+    `connecting`, so a booting bot reads as booting rather than vanishing from
+    its own status page.
     """
     ready = bool(client.is_ready())
     closed = bool(client.is_closed())
     per_shard = Counter(guild.shard_id for guild in client.guilds)
 
     shards: Mapping[int, Any] | None = getattr(client, "shards", None)
-    if not shards:
-        if shards is None:  # a plain, unsharded Client
-            shard_id = topology.shard_ids[0] if topology.shard_ids else 0
-            latency = float(getattr(client, "latency", float("nan")))
-            return [_shard_entry(shard_id, latency, closed, ready, per_shard[shard_id])]
-        return [
-            _shard_entry(shard_id, float("nan"), closed, False, per_shard[shard_id])
-            for shard_id in topology.shard_ids
-        ]
+    if shards is None:  # a plain, unsharded Client
+        shard_id = topology.shard_ids[0] if topology.shard_ids else 0
+        latency = float(getattr(client, "latency", float("nan")))
+        return [_shard_entry(shard_id, latency, closed, ready, per_shard[shard_id])]
 
     entries: list[dict[str, Any]] = []
-    for shard_id, info in sorted(shards.items()):
+    for shard_id in sorted({*local_shard_ids(client), *shards}):
         try:
-            shard_closed = closed or bool(info.is_closed())
+            info = shards[shard_id]
+            # A shard's own socket closes on every reconnect and RESUME, so it
+            # means "not ready". Only the whole client closing is terminal.
+            shard_ready = ready and not info.is_closed()
             latency = float(info.latency)
-            shard_ready = ready
         except Exception:
-            # A shard mid-reconnect has no usable websocket. "connecting" is the
-            # honest middle: not confirmed up, and certainly not confirmed down.
-            shard_closed, latency, shard_ready = False, float("nan"), False
-        entries.append(
-            _shard_entry(shard_id, latency, shard_closed, shard_ready, per_shard[shard_id])
-        )
+            # Not launched yet, or mid-reconnect with no usable websocket.
+            # "connecting" is the honest middle: not up, and not confirmed down.
+            shard_ready, latency = False, float("nan")
+        entries.append(_shard_entry(shard_id, latency, closed, shard_ready, per_shard[shard_id]))
     return entries
 
 
@@ -187,6 +184,11 @@ async def measure_server_count(
     what a bot list wants -- and does not drain during a Discord outage, so a
     local read needs no sanity backstop.
     """
+    # Before the callback too: every cluster posting at +5s burns the per-bot
+    # budget, and cluster 0's commands post gets suspended along with them.
+    if not topology.is_stats_publisher:
+        return None
+
     if server_count is not None:
         try:
             value = server_count()

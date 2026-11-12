@@ -7,10 +7,14 @@ can run in `setup_hook`.
 
 from __future__ import annotations
 
+from typing import Any
+
 import discord
 import pytest
 from discord.ext import commands
+from discord.shard import ShardInfo
 
+from conftest import FakeClient
 from thediscordlist import autopost
 from thediscordlist._topology import collect_shards, detect_topology
 
@@ -49,6 +53,15 @@ def test_a_real_auto_sharded_client_reports_every_declared_shard(
     assert [s["id"] for s in collect_shards(client, topology)] == [0, 1, 2, 3]
 
 
+def test_a_real_shard_with_a_closed_socket_reads_as_connecting() -> None:
+    class Parent:
+        id = 0
+        ws = type("Socket", (), {"open": False, "latency": 0.05})()
+
+    client = FakeClient(shard_count=1, shards={0: ShardInfo(Parent(), 1)})  # type: ignore[arg-type,dict-item]
+    assert collect_shards(client, detect_topology(client))[0]["status"] == "connecting"
+
+
 def test_a_real_subset_of_shards_withholds_the_cluster_count(
     intents: discord.Intents,
 ) -> None:
@@ -66,7 +79,7 @@ def test_a_real_client_reports_a_usable_shard_before_login(intents: discord.Inte
 
     assert entry["id"] == 0
     assert entry["status"] == "connecting"
-    assert entry["guilds"] == 0
+    assert "guilds" not in entry
     # `Client.latency` is nan without a websocket, and the API minimum is 0.
     assert "latency_ms" not in entry
 
@@ -89,6 +102,44 @@ async def test_autopost_hooks_a_real_bot_without_disturbing_it(
     assert poster.topology is not None
     assert poster.topology.kind == "single"
 
+    await poster.close()
+
+
+async def test_a_real_bot_hears_guild_changes_through_a_listener(
+    intents: discord.Intents,
+) -> None:
+    bot = commands.Bot(command_prefix="!", intents=intents)
+    bot._connection.application_id = 123456789012345678
+    poster = autopost(bot, "tok", base_url=DEAD)
+    assert poster._stats is not None
+
+    # What Bot.dispatch runs for a guild join; dispatching itself needs a logged-in loop.
+    for listener in bot.extra_events["on_guild_join"]:
+        await listener(object())
+
+    assert poster._stats._changed.is_set()
+    assert "on_guild_join" not in bot.__dict__  # the user's @bot.event slot stays free
+    await poster.close()
+
+
+async def test_a_real_client_hears_guild_changes_beside_its_own_handler(
+    intents: discord.Intents,
+) -> None:
+    client = discord.Client(intents=intents)
+    seen: list[Any] = []
+
+    @client.event
+    async def on_guild_remove(guild: Any) -> None:
+        seen.append(guild)
+
+    client._connection.application_id = 123456789012345678
+    poster = autopost(client, "tok", base_url=DEAD)
+    assert poster._stats is not None
+
+    await client.on_guild_remove("guild")  # what Client.dispatch looks up and runs
+
+    assert seen == ["guild"]
+    assert poster._stats._changed.is_set()
     await poster.close()
 
 

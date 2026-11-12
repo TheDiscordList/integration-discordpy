@@ -90,10 +90,40 @@ def test_a_booting_bot_reports_connecting_not_disconnected() -> None:
     assert collect_shards(client, detect_topology(client))[0]["status"] == "connecting"
 
 
-def test_a_closed_shard_reports_disconnected() -> None:
+def test_a_shard_mid_reconnect_reports_connecting_not_disconnected() -> None:
+    """A closed socket is transient; on the deployed server `disconnected` opens an incident."""
     client = FakeClient(shard_count=2, shards={0: FakeShard(0), 1: FakeShard(1, closed=True)})
     statuses = [s["status"] for s in collect_shards(client, detect_topology(client))]
-    assert statuses == ["ready", "disconnected"]
+    assert statuses == ["ready", "connecting"]
+
+
+def test_only_a_closed_client_reports_disconnected() -> None:
+    client = FakeClient(shard_count=2, shards={0: FakeShard(0), 1: FakeShard(1)}, closed=True)
+    statuses = [s["status"] for s in collect_shards(client, detect_topology(client))]
+    assert statuses == ["disconnected", "disconnected"]
+
+
+def test_shards_not_launched_yet_report_connecting() -> None:
+    client = FakeClient(shard_count=3, shards={0: FakeShard(0)}, ready=False)
+    shards = collect_shards(client, detect_topology(client))
+    assert [(s["id"], s["status"]) for s in shards] == [
+        (0, "connecting"),
+        (1, "connecting"),
+        (2, "connecting"),
+    ]
+
+
+def test_guilds_are_omitted_until_a_shard_is_ready() -> None:
+    """A restart's first `connecting` beat would otherwise zero the public count."""
+    client = FakeClient(guilds=5, ready=False)
+    assert "guilds" not in collect_shards(client, detect_topology(client))[0]
+
+    mid_reconnect = FakeClient(
+        guilds=5, shard_count=2, shards={0: FakeShard(0), 1: FakeShard(1, closed=True)}
+    )
+    ready, reconnecting = collect_shards(mid_reconnect, detect_topology(mid_reconnect))
+    assert "guilds" in ready
+    assert "guilds" not in reconnecting
 
 
 def test_guilds_are_counted_per_shard() -> None:
@@ -147,6 +177,19 @@ async def test_the_callback_wins_and_may_be_async() -> None:
 
     assert await measure_server_count(client, topology, total) == 4321
     assert await measure_server_count(client, topology, lambda: 99) == 99
+
+
+async def test_the_callback_is_not_asked_on_a_process_that_is_not_elected() -> None:
+    client = FakeClient(guilds=7, shard_count=8, shard_ids=[2, 3])
+    asked = False
+
+    def total() -> int:
+        nonlocal asked
+        asked = True
+        return 4321
+
+    assert await measure_server_count(client, detect_topology(client), total) is None
+    assert not asked
 
 
 async def test_a_broken_callback_yields_no_count_rather_than_a_wrong_one() -> None:

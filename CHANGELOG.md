@@ -1,23 +1,44 @@
-# Changelog
+# thediscordlist
 
-All notable changes to this package are documented here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
-[Semantic Versioning](https://semver.org/).
+## Unreleased
 
-## [Unreleased]
+### Minor Changes
 
-The first release, to ship as 0.1.0.
+- 5a1f00b: Supports **Pycord** (2.6+), **nextcord** (2.6+, 3.x on Python 3.12+) and **disnake** (2.9+) next to discord.py, chosen with the `discordpy`, `pycord`, `nextcord` and `disnake` extras. The only hard dependency is aiohttp, so installing for Pycord never pulls discord.py in over it.
 
-### Added
+## 0.2.1
 
-- `autopost(client, token)`: publishes the server count, per-process shard
-  heartbeats and the registered application commands to TheDiscordList, with
-  topology detection for single, auto-sharded and multi-process bots.
-- Support for **discord.py** (2.4+), **Pycord** (2.6+), **nextcord** (2.6+, 3.x
-  on Python 3.12+) and **disnake** (2.9+), chosen with the `discordpy`,
-  `pycord`, `nextcord` and `disnake` extras. The only hard dependency is
-  aiohttp, so installing for Pycord never pulls discord.py in over it.
-- `post_stats()`, `post_heartbeat()` and `post_commands()` for manual posts,
-  returning a `PostResult` instead of raising.
-- `thediscordlist.webhooks`: `verify_webhook()`, typed event payloads, and
-  ready-made aiohttp and ASGI handlers.
+### Patch Changes
+
+- ece4b51: An auto-sharded bot no longer reports a reconnecting shard as `disconnected`, which opened a public Down incident on its status page. Only a closed client reports it now, and a shard not launched yet or mid-reconnect reports `connecting`.
+- 5ddceee: A shard that is not ready leaves `guilds` out of its heartbeat entry, so a restart's first beat can no longer zero the public server count.
+- 8e63a1c: `AutoShardedBot` reports its real `shard_count` instead of 1, which was read in `setup_hook` before discord.py knew it.
+- b70fde9: A commands post that fails on a `5xx`, a network error, a rate limit or a Discord fetch tries again every 5 minutes until it lands or gets a `4xx` retrying cannot fix.
+- 4f5efe5: `server_count` only runs on the elected publisher, so a large bot no longer exhausts its rate limit at startup with every cluster posting at once.
+- 908ea64: A heartbeat `429` no longer suspends stats and commands, which have a limit of their own.
+- 0f563e4: After a `404`, a successful `post_stats()` or `post_heartbeat()` restarts its publisher loop, instead of working once and going stale.
+- cf76862: A shard state change sends a heartbeat soon after, at least 10 seconds after the previous one, as the other SDKs do.
+- f54d12f: A response body that is not UTF-8 is a transient failure rather than an exception, a webhook timestamp too large for a float is rejected as stale, and `asgi_webhook_app` no longer raises on a header that is not UTF-8.
+- 4ad94c3: `close()` landing during a manual post no longer reopens the HTTP session or restarts a publisher loop, which went on posting for as long as the process lived.
+- 18f83e9: A commands `429` that outlasts the 5-minute retry answers at once and tries again in 5 minutes, instead of holding `post_commands()` for up to an hour.
+- 113577e: A `post_commands()` that lands ends a pending retry, which would only post the same list again.
+
+## 0.2.0
+
+### Minor Changes
+
+- 373eaa0: Stats check the guild count every five minutes and post 20 seconds after the last guild join or removal, instead of polling every minute. The heartbeat honours a 403: it stays quiet until the 30-minute reprobe instead of beating into the plan gate every 30 seconds, and a configured `heartbeat_interval` is clamped to 15–60 seconds from the start.
+- 09ed045: `verify_webhook` and both webhook handlers raise `ValueError` for an empty secret instead of verifying against an empty key. Adds the `listing.bump_ready` event, typed as `ListingBumpReady` with `data.ready_at`.
+
+### Patch Changes
+
+- bcee69f: Only network errors, 408, 425, 429 and 5xx are retried; any other 4xx is reported once and not resent. A 429 is retried once its window lifts, if that comes before the next tick, and no rate-limit wait lasts longer than an hour.
+- 913214a: A token pasted with surrounding whitespace or a leading `Bearer ` is accepted.
+
+## 0.1.0
+
+### Minor Changes
+
+- 466ed33: Initial release: `autopost()` publishes server counts, cluster heartbeats and
+  application commands from any discord.py client, and `thediscordlist.webhooks`
+  verifies and handles inbound webhooks.

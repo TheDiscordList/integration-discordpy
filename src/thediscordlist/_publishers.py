@@ -12,7 +12,7 @@ import asyncio
 import logging
 import random
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -21,9 +21,12 @@ from ._topology import ServerCountFn, Topology, collect_shards, measure_server_c
 
 log = logging.getLogger("thediscordlist")
 
-#: Also the hard floor between two stats posts, so the ceiling is structurally
-#: one request per minute rather than statistically.
-STATS_MIN_INTERVAL = 60.0
+STATS_INTERVAL = 300.0
+#: A guild join or removal posts once the changes have been quiet this long.
+STATS_DEBOUNCE = 20.0
+#: The hard floor between two stats posts, so the ceiling is structurally one
+#: request per minute rather than statistically.
+STATS_MIN_GAP = 60.0
 #: Republish an unchanged count this often, so a listing never looks abandoned.
 STATS_FORCE_AFTER = 1800.0
 STATS_FIRST_DELAY = 5.0
@@ -32,9 +35,13 @@ HEARTBEAT_DEFAULT_INTERVAL = 30.0
 HEARTBEAT_MIN_INTERVAL = 15.0
 HEARTBEAT_MAX_INTERVAL = 60.0
 HEARTBEAT_JITTER = 5.0
+#: An out-of-band beat never follows the previous beat more closely than this.
+HEARTBEAT_OUT_OF_BAND_GAP = 10.0
+HEARTBEAT_OUT_OF_BAND_DELAY = 1.0
 
 #: Offset from the first stats post: the two share one server-side rate budget.
 COMMANDS_DELAY = 10.0
+COMMANDS_RETRY = 300.0
 
 #: The Gold tier is derived per request from Stripe, so it can flip mid-run.
 PLAN_REPROBE = 1800.0
@@ -74,6 +81,7 @@ class Publisher:
         self._disabled: str | None = None
         self._suspended_until = 0.0
         self._reported: set[int] = set()
+        self._changed = asyncio.Event()
 
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -93,6 +101,17 @@ class Publisher:
         """Does the work and returns the seconds to wait before the next tick."""
         raise NotImplementedError
 
+    async def _wait(self, delay: float) -> None:
+        await asyncio.sleep(delay)
+
+    async def _changed_within(self, seconds: float) -> bool:
+        try:
+            await asyncio.wait_for(self._changed.wait(), seconds)
+        except asyncio.TimeoutError:
+            return False
+        self._changed.clear()
+        return True
+
     async def _guarded(self) -> None:
         try:
             await self._prime()
@@ -104,7 +123,7 @@ class Publisher:
                 except Exception:
                     log.exception("[thediscordlist] the %s publisher failed", self.kind)
                     delay = 60.0
-                await asyncio.sleep(delay)
+                await self._wait(delay)
         except asyncio.CancelledError:
             pass
 
@@ -189,16 +208,26 @@ class Publisher:
         """An explicit ``post_*()`` re-arms a disabled publisher; a restart is the other way."""
         self._disabled = None
 
+    async def _rearmed(self, post: Callable[[], Awaitable[PostResult]]) -> PostResult:
+        """Runs a manual post, then restarts the loop a disable ended unless it disabled again.
+
+        After the post rather than from ``_rearm``, so the loop's first tick does
+        not double it.
+        """
+        was_disabled = self._disabled is not None
+        self._rearm()
+        result = await post()
+        if was_disabled and self._disabled is None and not self._d.api.closed:
+            self.start()
+        return result
+
 
 class StatsPublisher(Publisher):
-    """Polls the guild count and posts it when it moves.
+    """Posts the guild count when it moves: on a timer, and shortly after a guild change.
 
-    Polling replaces discord.js's debounced ``guildCreate``/``guildDelete``
-    hooks: the guild count is cheap to read, the poll cadence *is* the
-    rate-limit floor, and the unchanged-value skip does the rest. That skip
-    matters more than it looks -- every ``/stats`` post re-indexes the listing,
-    evaluates achievements and fires a ``bot.stats_reported`` webhook even when
-    the number did not move, and there is no server-side dedupe.
+    The server keeps an unchanged count from re-indexing or firing a webhook,
+    but the request still spends the budget stats and commands share, so the
+    unchanged-value skip stays.
     """
 
     kind: PublisherKind = "stats"
@@ -206,19 +235,19 @@ class StatsPublisher(Publisher):
     def __init__(
         self,
         deps: Deps,
-        interval: float = STATS_MIN_INTERVAL,
+        interval: float = STATS_INTERVAL,
         server_count: ServerCountFn | None = None,
     ) -> None:
         super().__init__(deps)
-        if interval < STATS_MIN_INTERVAL:
+        if interval < STATS_MIN_GAP:
             log.warning(
                 "[thediscordlist] stats_interval=%.0fs is below the %.0fs rate-limit floor; "
                 "using %.0fs",
                 interval,
-                STATS_MIN_INTERVAL,
-                STATS_MIN_INTERVAL,
+                STATS_MIN_GAP,
+                STATS_MIN_GAP,
             )
-        self._interval = max(interval, STATS_MIN_INTERVAL)
+        self._interval = max(interval, STATS_MIN_GAP)
         self._server_count = server_count
         self._last_post_at = 0.0
         self._last: tuple[int, int] | None = None
@@ -228,12 +257,29 @@ class StatsPublisher(Publisher):
         await asyncio.sleep(STATS_FIRST_DELAY)
 
     async def _tick(self) -> float:
-        await self._publish(manual=False)
+        result = await self._publish(manual=False)
+        now = time.monotonic()
+        if result.skipped == "plan":
+            return self._suspended_until - now
+        if result.skipped == "min-gap":
+            return self._last_post_at + STATS_MIN_GAP - now
         return self._interval
 
+    def on_guild_change(self) -> None:
+        self._changed.set()
+
+    async def _wait(self, delay: float) -> None:
+        """A trailing debounce on guild changes, capped so a join storm cannot starve the post."""
+        if not await self._changed_within(delay):
+            return
+        cap = time.monotonic() + STATS_MIN_GAP
+        while (left := cap - time.monotonic()) > 0 and await self._changed_within(
+            min(STATS_DEBOUNCE, left)
+        ):
+            pass
+
     async def post(self) -> PostResult:
-        self._rearm()
-        return await self._publish(manual=True)
+        return await self._rearmed(lambda: self._publish(manual=True))
 
     async def _publish(self, *, manual: bool) -> PostResult:
         async with self._lock:
@@ -245,14 +291,18 @@ class StatsPublisher(Publisher):
                 return PostResult(False, None, "plan")
             # A hard monotonic floor. A join storm, a mass reconnect and a manual
             # post_stats() all route through it.
-            if self._last_post_at and now - self._last_post_at < self._interval:
+            if self._last_post_at and now - self._last_post_at < STATS_MIN_GAP:
                 return PostResult(False, None, "min-gap")
 
             count = await measure_server_count(self._d.client, self._d.topology, self._server_count)
             if count is None:
                 return PostResult(False, None, "not-elected")
 
-            shard_count = self._d.topology.shard_count
+            # Read live: an auto-sharded client only learns its count after setup_hook,
+            # which is when the topology was detected.
+            shard_count = (
+                getattr(self._d.client, "shard_count", None) or self._d.topology.shard_count
+            )
             if self._last == (count, shard_count) and now - self._last_post_at < STATS_FORCE_AFTER:
                 return PostResult(False, None, "unchanged")
 
@@ -280,7 +330,8 @@ class HeartbeatPublisher(Publisher):
 
     def __init__(self, deps: Deps, interval: float = HEARTBEAT_DEFAULT_INTERVAL) -> None:
         super().__init__(deps)
-        self._interval = interval
+        self._interval = _clamp_heartbeat(interval)
+        self._last_beat_at = 0.0
 
     def start(self) -> None:
         # Every beat hard-deletes the listing's cluster rows whose
@@ -300,17 +351,33 @@ class HeartbeatPublisher(Publisher):
 
     async def _tick(self) -> float:
         await self._beat(manual=False)
+        delay = max(self._interval, self._suspended_until - time.monotonic())
         # Jitter de-locksteps N cluster processes that all started from one deploy.
-        return self._interval + random.uniform(0.0, HEARTBEAT_JITTER)
+        return delay + random.uniform(0.0, HEARTBEAT_JITTER)
+
+    def beat_now(self) -> None:
+        """Out-of-band beat after a shard state change. Calls before it fires coalesce into one."""
+        self._changed.set()
+
+    async def _wait(self, delay: float) -> None:
+        """A 30s cadence against a 90s grace leaves no margin during a reconnect."""
+        deadline = time.monotonic() + delay
+        if not await self._changed_within(delay):
+            return
+        now = time.monotonic()
+        gap = self._last_beat_at + HEARTBEAT_OUT_OF_BAND_GAP - now
+        await asyncio.sleep(min(max(gap, HEARTBEAT_OUT_OF_BAND_DELAY), deadline - now))
+        self._changed.clear()
 
     async def post(self) -> PostResult:
-        self._rearm()
-        return await self._beat(manual=True)
+        return await self._rearmed(lambda: self._beat(manual=True))
 
     async def _beat(self, *, manual: bool) -> PostResult:
         async with self._lock:
             if not manual and self._disabled is not None:
                 return PostResult(False, None, "disabled")
+            if time.monotonic() < self._suspended_until:
+                return PostResult(False, None, "plan")
             cluster_count = self._d.topology.cluster_count
             if cluster_count is None:
                 return PostResult(False, None, "cluster-count-unknown")
@@ -319,6 +386,7 @@ class HeartbeatPublisher(Publisher):
             if not shards:  # the API requires at least one entry
                 return PostResult(False, None, "no-shards")
 
+            self._last_beat_at = time.monotonic()
             return await self._send(
                 f"/bots/{self._d.bot_id}/heartbeat",
                 {
@@ -336,15 +404,21 @@ class HeartbeatPublisher(Publisher):
         if outcome.kind == "ok" and isinstance(outcome.body, dict):
             grace = outcome.body.get("next_beat_within_seconds")
             if isinstance(grace, (int, float)) and not isinstance(grace, bool) and grace > 0:
-                self._interval = min(max(grace / 3, HEARTBEAT_MIN_INTERVAL), HEARTBEAT_MAX_INTERVAL)
+                self._interval = _clamp_heartbeat(grace / 3)
         return super()._react(outcome)
+
+
+def _clamp_heartbeat(interval: float) -> float:
+    return min(max(interval, HEARTBEAT_MIN_INTERVAL), HEARTBEAT_MAX_INTERVAL)
 
 
 class CommandsPublisher(Publisher):
     """Posts the application command list once, shortly after ready.
 
     No periodic re-check and no content hashing: commands change on deploy, and
-    a deploy is a restart. ``post_commands()`` covers an in-process re-register.
+    a deploy is a restart. A post that fails would leave them stale until the
+    next one, so it tries again until it lands. ``post_commands()`` covers an
+    in-process re-register.
     """
 
     kind: PublisherKind = "commands"
@@ -359,7 +433,10 @@ class CommandsPublisher(Publisher):
                 return  # global commands are identical in every process
             await self._d.client.wait_until_ready()
             await asyncio.sleep(COMMANDS_DELAY)
-            await self._publish()
+            while True:
+                if not _worth_retrying(await self._publish()):
+                    return
+                await asyncio.sleep(COMMANDS_RETRY)
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -367,7 +444,10 @@ class CommandsPublisher(Publisher):
 
     async def post(self) -> PostResult:
         self._rearm()
-        return await self._publish()
+        result = await self._publish()
+        if result.ok:
+            self.stop()  # a pending retry would only post the same list again
+        return result
 
     async def _publish(self) -> PostResult:
         async with self._lock:
@@ -394,4 +474,15 @@ class CommandsPublisher(Publisher):
             if not raw and not self._post_empty:
                 return PostResult(False, None, "empty")
 
-            return await self._send(f"/bots/{self._d.bot_id}/commands", {"commands": raw})
+            return await self._send(
+                f"/bots/{self._d.bot_id}/commands", {"commands": raw}, next_tick=COMMANDS_RETRY
+            )
+
+
+def _worth_retrying(result: PostResult) -> bool:
+    """A success, nothing to send, or a 4xx the same request would only get again end it."""
+    if result.ok or result.skipped in ("empty", "disabled"):
+        return False
+    if result.skipped is not None:
+        return True
+    return result.status is None or not 400 <= result.status < 500 or result.status in (408, 425)

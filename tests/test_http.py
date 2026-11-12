@@ -6,6 +6,7 @@ the headers and the body draining for real, and costs about ten lines.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import AsyncIterator, Callable
 from typing import Any
@@ -13,7 +14,10 @@ from typing import Any
 import pytest
 from aiohttp import web
 
+from conftest import FakeClient
+from thediscordlist import Autoposter
 from thediscordlist._http import ApiClient, backoff
+from thediscordlist._publishers import PostResult
 
 
 class Server:
@@ -81,8 +85,12 @@ async def test_a_successful_post_sends_the_token_and_parses_the_body(
         (401, "auth"),
         (403, "plan"),
         (404, "config"),
+        (405, "payload"),
+        (408, "transient"),
         (409, "config"),
+        (413, "payload"),
         (422, "payload"),
+        (425, "transient"),
         (500, "transient"),
         (503, "transient"),
     ],
@@ -118,6 +126,19 @@ async def test_transient_failures_are_retried_three_times(
     assert len(server.requests) == 3
 
 
+async def test_a_client_error_is_never_retried(
+    server: Server, make_client: Callable[[], ApiClient]
+) -> None:
+    server.reply(web.json_response({}, status=413), web.json_response({"ok": True}))
+    client = make_client()
+
+    outcome = await client.post("/bots/1/stats", {}, next_tick=600)
+    await client.close()
+
+    assert outcome.kind == "payload"
+    assert len(server.requests) == 1
+
+
 async def test_a_retry_is_dropped_when_the_next_tick_arrives_first(
     server: Server, make_client: Callable[[], ApiClient]
 ) -> None:
@@ -142,7 +163,7 @@ async def test_a_429_suspends_normal_traffic_but_never_heartbeats(
     )
     client = make_client()
 
-    throttled = await client.post("/bots/1/stats", {})
+    throttled = await client.post("/bots/1/stats", {}, next_tick=1)
     assert throttled.kind == "throttled"
     assert throttled.retry_after == 30
 
@@ -154,6 +175,28 @@ async def test_a_429_suspends_normal_traffic_but_never_heartbeats(
 
     await client.close()
     assert len(server.requests) == 2  # the dropped post never left the process
+
+
+async def test_a_heartbeat_429_leaves_stats_alone_and_waits_out_its_own_window(
+    server: Server, make_client: Callable[[], ApiClient], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("thediscordlist._http.random.uniform", lambda a, b: 0.0)
+    server.reply(
+        web.json_response({}, status=429, headers={"retry-after": "30"}),
+        web.json_response({"ok": True}),
+        web.json_response({}, status=429, headers={"retry-after": "0.1"}),
+    )
+    client = make_client()
+
+    assert (await client.post("/bots/1/heartbeat", {}, heartbeat=True, next_tick=1)).status == 429
+    assert (await client.post("/bots/1/stats", {})).kind == "ok"
+
+    started = time.monotonic()
+    assert (await client.post("/bots/1/heartbeat", {}, heartbeat=True, next_tick=600)).kind == "ok"
+    await client.close()
+
+    assert time.monotonic() - started >= 0.05  # not at once, allowing for a coarse clock
+    assert len(server.requests) == 4
 
 
 async def test_a_connection_failure_is_transient_not_a_crash() -> None:
@@ -172,6 +215,18 @@ async def test_a_non_json_body_does_not_raise(
     outcome = await client.post("/bots/1/stats", {}, next_tick=0.0001)
     await client.close()
     assert outcome.kind == "transient"
+
+
+async def test_a_body_that_is_not_utf8_does_not_raise(
+    server: Server, make_client: Callable[[], ApiClient]
+) -> None:
+    server.reply(web.Response(body=b"\xff\xfe", status=502, content_type="text/html"))
+    client = make_client()
+
+    outcome = await client.post("/bots/1/stats", {}, next_tick=0.0001)
+    await client.close()
+
+    assert (outcome.kind, outcome.status) == ("transient", 502)
 
 
 async def test_the_session_can_be_closed_twice(
@@ -203,8 +258,83 @@ async def test_a_429_reset_header_beats_a_short_retry_after(
     )
     client = make_client()
 
-    await client.post("/bots/1/stats", {})
-    remaining = client._suspended_until - time.monotonic()
+    await client.post("/bots/1/stats", {}, next_tick=1)
+    remaining = client._rate_limited_until - time.monotonic()
     await client.close()
 
     assert 110 < remaining < 125
+
+
+async def test_a_429_is_retried_once_its_window_lifts_before_the_next_tick(
+    server: Server, make_client: Callable[[], ApiClient], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("thediscordlist._http.random.uniform", lambda a, b: 0.0)
+    server.reply(web.json_response({}, status=429, headers={"retry-after": "0.05"}))
+    client = make_client()
+
+    outcome = await client.post("/bots/1/stats", {}, next_tick=600)
+    await client.close()
+
+    assert outcome.kind == "ok"
+    assert len(server.requests) == 2
+
+
+async def test_a_429_never_suspends_for_more_than_an_hour(
+    server: Server, make_client: Callable[[], ApiClient]
+) -> None:
+    server.reply(
+        web.json_response(
+            {},
+            status=429,
+            headers={"retry-after": "86400", "x-ratelimit-reset": str(int(time.time()) + 86400)},
+        )
+    )
+    client = make_client()
+
+    await client.post("/bots/1/stats", {}, next_tick=1)
+    remaining = client._rate_limited_until - time.monotonic()
+    await client.close()
+
+    assert 3590 < remaining <= 3602
+
+
+async def test_close_during_a_manual_post_ends_publishing_for_good(
+    server: Server, make_client: Callable[[], ApiClient], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A loop restarted after close() would keep posting in a process that stays alive."""
+    closing: list[asyncio.Task[None]] = []
+
+    def close_during_the_retry_wait(_: int) -> float:
+        closing.append(asyncio.create_task(poster.close()))
+        return 0.01
+
+    monkeypatch.setattr("thediscordlist._publishers.STATS_MIN_GAP", 0.0)
+    monkeypatch.setattr("thediscordlist._http.backoff", close_during_the_retry_wait)
+    server.reply(web.Response(status=404), web.Response(status=503))
+    client = make_client()
+    poster = Autoposter(FakeClient(), client, heartbeat=False, commands=False)
+    poster.start()
+    assert poster._stats is not None
+    assert (await poster.post_stats()).status == 404
+
+    await poster.post_stats()
+    await asyncio.gather(*closing)
+
+    assert len(server.requests) == 2
+    assert poster._stats._task is None
+    assert client._session is None
+
+
+async def test_a_commands_429_that_outlasts_the_retry_answers_at_once(
+    server: Server, make_client: Callable[[], ApiClient]
+) -> None:
+    """Waited out inside the post, it would hold the lock a manual post_commands() needs."""
+    server.reply(web.json_response({}, status=429, headers={"retry-after": "3600"}))
+    client = FakeClient(commands=[{"name": "ping"}])
+    poster = Autoposter(client, make_client(), stats=False, heartbeat=False)
+    poster.start()
+
+    result = await asyncio.wait_for(poster.post_commands(), 5)
+    await poster.close()
+
+    assert result == PostResult(False, 429, "throttled")

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from typing import Any
 
 import pytest
@@ -8,11 +10,15 @@ import pytest
 from conftest import FakeApi, FakeClient, FakeShard
 from thediscordlist._http import Outcome
 from thediscordlist._publishers import (
+    PLAN_REPROBE,
     STATS_FORCE_AFTER,
+    STATS_INTERVAL,
+    STATS_MIN_GAP,
     CommandsPublisher,
     Deps,
     HeartbeatPublisher,
     StatsPublisher,
+    _worth_retrying,
 )
 from thediscordlist._topology import detect_topology
 
@@ -21,6 +27,11 @@ BOT_ID = "123456789012345678"
 
 def make_deps(client: Any, api: FakeApi, **kwargs: Any) -> Deps:
     return Deps(api, client, detect_topology(client, **kwargs), BOT_ID)  # type: ignore[arg-type]
+
+
+@pytest.fixture
+def no_min_gap(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("thediscordlist._publishers.STATS_MIN_GAP", 0.0)
 
 
 # -- stats ------------------------------------------------------------------
@@ -39,12 +50,23 @@ async def test_stats_posts_the_count_and_always_sends_shard_count() -> None:
     assert api.bodies[0] == {"server_count": 42, "shard_count": 4}
 
 
+async def test_stats_sends_the_shard_count_an_auto_sharded_client_learned_after_setup() -> None:
+    client = FakeClient(guilds=42, shards={})
+    api = FakeApi()
+    stats = StatsPublisher(make_deps(client, api))
+
+    client.shard_count = 4  # what launch_shards() sets, after setup_hook
+    await stats.post()
+
+    assert api.bodies[0]["shard_count"] == 4
+
+
+@pytest.mark.usefixtures("no_min_gap")
 async def test_stats_skips_an_unchanged_count() -> None:
-    """Every post re-indexes the listing and fires a webhook, even unchanged."""
+    """An unchanged post has no side effects, but still spends the shared budget."""
     client = FakeClient(guilds=42)
     api = FakeApi()
     stats = StatsPublisher(make_deps(client, api))
-    stats._interval = 0  # let the min-gap floor out of the way
 
     assert (await stats.post()).ok
     second = await stats.post()
@@ -53,11 +75,11 @@ async def test_stats_skips_an_unchanged_count() -> None:
     assert len(api.calls) == 1
 
 
+@pytest.mark.usefixtures("no_min_gap")
 async def test_stats_reposts_an_unchanged_count_eventually() -> None:
     client = FakeClient(guilds=42)
     api = FakeApi()
     stats = StatsPublisher(make_deps(client, api))
-    stats._interval = 0
 
     await stats.post()
     stats._last_post_at -= STATS_FORCE_AFTER + 1
@@ -66,11 +88,11 @@ async def test_stats_reposts_an_unchanged_count_eventually() -> None:
     assert len(api.calls) == 2
 
 
+@pytest.mark.usefixtures("no_min_gap")
 async def test_stats_posts_again_when_the_count_moves() -> None:
     client = FakeClient(guilds=42)
     api = FakeApi()
     stats = StatsPublisher(make_deps(client, api))
-    stats._interval = 0
 
     await stats.post()
     client.guilds.append(client.guilds[0])
@@ -91,6 +113,49 @@ async def test_stats_enforces_a_hard_floor_between_posts() -> None:
 
     assert second.skipped == "min-gap"
     assert len(api.calls) == 1
+
+
+async def test_a_min_gap_skip_retries_when_the_gap_ends_not_a_full_interval_later() -> None:
+    stats = StatsPublisher(make_deps(FakeClient(), FakeApi()))
+    await stats.post()
+
+    delay = await stats._tick()
+
+    assert stats._interval == STATS_INTERVAL
+    assert 0 < delay <= STATS_MIN_GAP
+
+
+async def test_a_guild_change_ends_the_wait_once_it_goes_quiet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("thediscordlist._publishers.STATS_DEBOUNCE", 0.01)
+    stats = StatsPublisher(make_deps(FakeClient(), FakeApi()))
+
+    waiting = asyncio.create_task(stats._wait(STATS_INTERVAL))
+    await asyncio.sleep(0)
+    stats.on_guild_change()
+
+    await asyncio.wait_for(waiting, 1)
+
+
+async def test_a_join_storm_cannot_hold_the_post_back_past_the_min_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("thediscordlist._publishers.STATS_DEBOUNCE", 0.05)
+    monkeypatch.setattr("thediscordlist._publishers.STATS_MIN_GAP", 0.2)
+    stats = StatsPublisher(make_deps(FakeClient(), FakeApi()))
+
+    async def storm() -> None:
+        while True:
+            stats.on_guild_change()
+            await asyncio.sleep(0.01)
+
+    storming = asyncio.create_task(storm())
+    started = time.monotonic()
+    await asyncio.wait_for(stats._wait(STATS_INTERVAL), 2)
+    storming.cancel()
+
+    assert time.monotonic() - started < 1
 
 
 async def test_stats_below_the_floor_is_clamped_and_warned(
@@ -127,6 +192,26 @@ async def test_heartbeat_reports_this_process_only() -> None:
     assert body["cluster_count"] == 1
     assert [s["id"] for s in body["shards"]] == [0, 1]
     assert api.calls[0][2] is True  # sent with heartbeat priority
+
+
+async def test_a_shard_state_change_beats_out_of_band_at_most_once_per_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("thediscordlist._publishers.HEARTBEAT_OUT_OF_BAND_GAP", 0.1)
+    monkeypatch.setattr("thediscordlist._publishers.HEARTBEAT_OUT_OF_BAND_DELAY", 0.01)
+    heartbeat = HeartbeatPublisher(make_deps(FakeClient(), FakeApi()))
+    await heartbeat.post()
+
+    started = time.monotonic()
+    waiting = asyncio.create_task(heartbeat._wait(60))
+    await asyncio.sleep(0)
+    heartbeat.beat_now()
+    await asyncio.sleep(0.01)
+    heartbeat.beat_now()  # a burst, while the first is still settling
+    await asyncio.wait_for(waiting, 1)
+
+    assert 0.05 < time.monotonic() - started < 1
+    assert not heartbeat._changed.is_set()
 
 
 async def test_heartbeat_refuses_to_start_without_a_cluster_count(
@@ -174,12 +259,19 @@ async def test_the_retuned_cadence_is_clamped(grace: int, expected: float) -> No
     assert heartbeat._interval == expected
 
 
-async def test_heartbeat_skips_a_beat_with_no_shards_to_report() -> None:
-    client = FakeClient(shard_count=2, shards={})
-    api = FakeApi()
-    deps = make_deps(client, api)
-    object.__setattr__(deps.topology, "shard_ids", ())
-    heartbeat = HeartbeatPublisher(deps)
+@pytest.mark.parametrize(("interval", "expected"), [(1, 15.0), (45, 45.0), (600, 60.0)])
+async def test_a_configured_cadence_is_clamped_before_the_first_beat(
+    interval: float, expected: float
+) -> None:
+    heartbeat = HeartbeatPublisher(make_deps(FakeClient(), FakeApi()), interval)
+    assert heartbeat._interval == expected
+
+
+async def test_heartbeat_skips_a_beat_with_no_shards_to_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("thediscordlist._publishers.collect_shards", lambda *_: [])
+    heartbeat = HeartbeatPublisher(make_deps(FakeClient(shard_count=2, shards={}), FakeApi()))
 
     assert (await heartbeat.post()).skipped == "no-shards"
 
@@ -223,6 +315,119 @@ async def test_a_discord_failure_does_not_escape_the_publisher() -> None:
     assert (await CommandsPublisher(make_deps(client, api)).post()).skipped == "fetch-failed"
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        Outcome("transient", 502, error=RuntimeError("Bad Gateway")),
+        Outcome("transient", error=OSError("connection reset")),
+        Outcome("dropped"),
+        Outcome("throttled", 429, retry_after=1.0),
+    ],
+)
+async def test_commands_tries_again_until_it_lands(
+    monkeypatch: pytest.MonkeyPatch, failure: Outcome
+) -> None:
+    monkeypatch.setattr("thediscordlist._publishers.COMMANDS_DELAY", 0.0)
+    monkeypatch.setattr("thediscordlist._publishers.COMMANDS_RETRY", 0.0)
+    api = FakeApi(failure, failure)
+    publisher = CommandsPublisher(make_deps(FakeClient(commands=[{"name": "ping"}]), api))
+
+    publisher.start()
+    assert publisher._task is not None
+    await asyncio.wait_for(publisher._task, 1)
+
+    assert len(api.calls) == 3
+
+
+async def test_commands_tries_again_after_a_failed_discord_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("thediscordlist._publishers.COMMANDS_DELAY", 0.0)
+    monkeypatch.setattr("thediscordlist._publishers.COMMANDS_RETRY", 0.0)
+    client = FakeClient(commands=[{"name": "ping"}])
+    fetch = client.http.get_global_commands
+    attempts = 0
+
+    async def flaky(application_id: int) -> Any:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("Discord is down")
+        return await fetch(application_id)
+
+    client.http.get_global_commands = flaky  # type: ignore[method-assign]
+    api = FakeApi()
+    publisher = CommandsPublisher(make_deps(client, api))
+
+    publisher.start()
+    assert publisher._task is not None
+    await asyncio.wait_for(publisher._task, 1)
+
+    assert attempts == 2
+    assert len(api.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [Outcome("payload", 422, {}), Outcome("auth", 401), Outcome("config", 404)],
+)
+async def test_commands_stops_at_a_4xx_the_same_request_would_only_get_again(
+    monkeypatch: pytest.MonkeyPatch, failure: Outcome
+) -> None:
+    monkeypatch.setattr("thediscordlist._publishers.COMMANDS_DELAY", 0.0)
+    monkeypatch.setattr("thediscordlist._publishers.COMMANDS_RETRY", 0.0)
+    api = FakeApi(failure)
+    publisher = CommandsPublisher(make_deps(FakeClient(commands=[{"name": "ping"}]), api))
+
+    publisher.start()
+    assert publisher._task is not None
+    await asyncio.wait_for(publisher._task, 1)
+
+    assert len(api.calls) == 1
+
+
+async def test_a_manual_post_that_lands_ends_the_pending_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The retry would only post the same list again, against the budget stats share."""
+    monkeypatch.setattr("thediscordlist._publishers.COMMANDS_DELAY", 0.0)
+    monkeypatch.setattr("thediscordlist._publishers.COMMANDS_RETRY", 0.05)
+    api = FakeApi(Outcome("transient", 502, error=RuntimeError("Bad Gateway")))
+    publisher = CommandsPublisher(make_deps(FakeClient(commands=[{"name": "ping"}]), api))
+
+    publisher.start()
+    await asyncio.sleep(0.01)
+    assert len(api.calls) == 1
+
+    assert (await publisher.post()).ok
+    await asyncio.sleep(0.1)
+
+    assert len(api.calls) == 2
+
+
+async def test_commands_stops_when_discord_lists_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("thediscordlist._publishers.COMMANDS_DELAY", 0.0)
+    monkeypatch.setattr("thediscordlist._publishers.COMMANDS_RETRY", 0.0)
+    client = FakeClient(commands=[])
+    publisher = CommandsPublisher(make_deps(client, FakeApi()))
+
+    publisher.start()
+    assert publisher._task is not None
+    await asyncio.wait_for(publisher._task, 1)
+
+    assert len(client.http.calls) == 1
+
+
+async def test_commands_reprobes_after_a_403_without_sending_until_the_suspension_ends() -> None:
+    """The plan gate can lift mid-run, so a 403 keeps its 30-minute reprobe."""
+    api = FakeApi(Outcome("plan", 403))
+    publisher = CommandsPublisher(make_deps(FakeClient(commands=[{"name": "ping"}]), api))
+
+    assert _worth_retrying(await publisher._publish())
+    assert _worth_retrying(await publisher._publish())
+    assert len(api.calls) == 1
+
+
 # -- the error taxonomy, as publishers see it -------------------------------
 
 
@@ -254,6 +459,21 @@ async def test_a_403_suspends_rather_than_disables(caplog: pytest.LogCaptureFixt
     assert "higher plan" in caplog.text
 
 
+async def test_a_403_silences_the_heartbeat_until_the_reprobe() -> None:
+    """A free-tier bot must not keep beating every 30s into a plan gate."""
+    api = FakeApi(Outcome("plan", 403))
+    heartbeat = HeartbeatPublisher(make_deps(FakeClient(), api))
+
+    delay = await heartbeat._tick()
+
+    assert delay >= PLAN_REPROBE - 1
+    assert (await heartbeat._beat(manual=False)).skipped == "plan"
+    assert len(api.calls) == 1
+
+    heartbeat._suspended_until = 0.0
+    assert (await heartbeat._beat(manual=False)).ok
+
+
 async def test_a_404_never_reads_as_a_bad_token(caplog: pytest.LogCaptureFixture) -> None:
     stats = StatsPublisher(make_deps(FakeClient(), FakeApi(Outcome("config", 404))))
 
@@ -265,12 +485,12 @@ async def test_a_404_never_reads_as_a_bad_token(caplog: pytest.LogCaptureFixture
     assert "no bot listing found" in caplog.text
 
 
+@pytest.mark.usefixtures("no_min_gap")
 async def test_a_422_keeps_the_publisher_alive_and_is_reported_once(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     api = FakeApi(Outcome("payload", 422, {"message": "bad"}), Outcome("payload", 422, {}))
     stats = StatsPublisher(make_deps(FakeClient(), api))
-    stats._interval = 0
 
     with caplog.at_level(logging.WARNING, logger="thediscordlist"):
         await stats.post()
@@ -280,10 +500,10 @@ async def test_a_422_keeps_the_publisher_alive_and_is_reported_once(
     assert caplog.text.count("rejected the stats payload") == 1
 
 
+@pytest.mark.usefixtures("no_min_gap")
 async def test_a_manual_post_re_arms_a_disabled_publisher() -> None:
     api = FakeApi(Outcome("config", 404))
     stats = StatsPublisher(make_deps(FakeClient(), api))
-    stats._interval = 0
 
     await stats.post()
     assert stats._disabled == "not-found"
@@ -291,12 +511,36 @@ async def test_a_manual_post_re_arms_a_disabled_publisher() -> None:
     assert (await stats.post()).ok
 
 
+@pytest.mark.usefixtures("no_min_gap")
+async def test_a_manual_post_restarts_the_loop_a_disable_ended() -> None:
+    """Without the loop, post_stats() works once and the count goes stale."""
+    api = FakeApi(Outcome("config", 404))
+    stats = StatsPublisher(make_deps(FakeClient(), api))
+
+    await stats.post()
+    assert stats._task is None
+
+    await stats.post()
+    assert stats._task is not None
+    assert not stats._task.done()
+    stats.stop()
+
+
+@pytest.mark.usefixtures("no_min_gap")
+async def test_a_manual_post_leaves_the_loop_off_when_it_disables_again() -> None:
+    api = FakeApi(Outcome("config", 404), Outcome("config", 404))
+    stats = StatsPublisher(make_deps(FakeClient(), api))
+
+    await stats.post()
+    await stats.post()
+
+    assert stats._task is None
+
+
 async def test_a_publisher_loop_survives_a_tick_that_raises(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Nothing in this package may take a bot down."""
-    import asyncio
-
     stats = StatsPublisher(make_deps(FakeClient(), FakeApi()))
     ticks = 0
 

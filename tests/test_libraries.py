@@ -88,7 +88,8 @@ async def test_a_client_reports_a_usable_shard_before_login(lib: ModuleType) -> 
     client = lib.Client(intents=lib.Intents.default())
     entry = collect_shards(client, detect_topology(client))[0]
 
-    assert (entry["id"], entry["status"], entry["guilds"]) == (0, "connecting", 0)
+    assert (entry["id"], entry["status"]) == (0, "connecting")
+    assert "guilds" not in entry  # an unready shard must not zero the count
     assert "latency_ms" not in entry  # `latency` is nan without a websocket
     await client.close()
 

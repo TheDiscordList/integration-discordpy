@@ -11,6 +11,7 @@ from thediscordlist.webhooks import (
     MAX_BODY_BYTES,
     WebhookContext,
     WebhookError,
+    aiohttp_webhook_handler,
     asgi_webhook_app,
     verify_webhook,
 )
@@ -30,6 +31,22 @@ BODY = json.dumps(
             "url": "https://thediscordlist.com/bots/161660517914509312",
         },
         "data": {"voted_at": "2026-08-14T12:34:56+00:00", "total_upvotes": 42, "user": None},
+    }
+)
+
+
+BUMP_READY = json.dumps(
+    {
+        "id": "0c7c2f4e-8a0d-4bde-9d0e-5b8f6f1a2c3d",
+        "event": "listing.bump_ready",
+        "created_at": "2026-08-14T12:34:56+00:00",
+        "listing": {
+            "id": "161660517914509312",
+            "type": "bot",
+            "name": "Test",
+            "url": "https://thediscordlist.com/bots/161660517914509312",
+        },
+        "data": {"ready_at": "2026-08-14T12:34:56+00:00"},
     }
 )
 
@@ -77,6 +94,25 @@ def test_a_header_part_with_extra_equals_signs_still_parses() -> None:
     assert verify_webhook(BODY, f"{sign()},v0=YWJj==", SECRET, now=now)
 
 
+def test_accepts_a_bump_ready_delivery() -> None:
+    event = verify_webhook(BUMP_READY, sign(BUMP_READY), SECRET, now=now)
+    assert event["event"] == "listing.bump_ready"
+    assert event["data"]["ready_at"] == "2026-08-14T12:34:56+00:00"
+
+
+@pytest.mark.parametrize("secret", ["", "   "])
+def test_an_empty_secret_is_a_configuration_error_not_a_key(secret: str) -> None:
+    """An empty HMAC key would verify any delivery signed with an empty key."""
+    with pytest.raises(ValueError, match="secret is required"):
+        verify_webhook(BODY, sign(secret=secret), secret, now=now)
+
+
+@pytest.mark.parametrize("factory", [asgi_webhook_app, aiohttp_webhook_handler])
+def test_a_handler_refuses_to_start_without_a_secret(factory: Any) -> None:
+    with pytest.raises(ValueError, match="secret is required"):
+        factory("", lambda event, ctx: None)
+
+
 @pytest.mark.parametrize(
     ("body", "signature", "code"),
     [
@@ -84,6 +120,7 @@ def test_a_header_part_with_extra_equals_signs_still_parses() -> None:
         (BODY.replace("42", "43"), sign(), "INVALID_SIGNATURE"),
         (BODY, sign(t=int(NOW) - 301), "STALE_TIMESTAMP"),
         (BODY, sign(t=int(NOW) + 301), "STALE_TIMESTAMP"),
+        (BODY, f"t={'9' * 400},v1={'a' * 64}", "STALE_TIMESTAMP"),
         (BODY, "v1=deadbeef", "MALFORMED_SIGNATURE"),
         (BODY, f"t={int(NOW)}", "MALFORMED_SIGNATURE"),
         (BODY, f"t=not-a-number,v1={'a' * 64}", "MALFORMED_SIGNATURE"),
@@ -175,6 +212,21 @@ async def test_asgi_rejects_a_stale_delivery_with_400() -> None:
     app = asgi_webhook_app(SECRET, lambda event, ctx: None, tolerance_seconds=0)
     status, _ = await call_asgi(app, BODY.encode(), {"x-tdl-signature": sign(t=1)})
     assert status == 400
+
+
+async def test_asgi_rejects_a_header_that_is_not_utf8_instead_of_raising() -> None:
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": BODY.encode(), "more_body": False}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    scope = {"type": "http", "method": "POST", "headers": [(b"x-tdl-signature", b"t=\xff")]}
+    await asgi_webhook_app(SECRET, lambda *_: None)(scope, receive, send)
+
+    assert sent[0]["status"] == 400
 
 
 async def test_asgi_answers_405_to_anything_but_post() -> None:

@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import sys
-from typing import Any
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, TypedDict
 
 from ._http import DEFAULT_BASE_URL, ApiClient
 from ._publishers import (
     HEARTBEAT_DEFAULT_INTERVAL,
-    STATS_MIN_INTERVAL,
+    STATS_INTERVAL,
     CommandsPublisher,
     Deps,
     HeartbeatPublisher,
@@ -19,11 +21,33 @@ from ._publishers import (
 )
 from ._topology import ServerCountFn, Topology, detect_topology
 
+if TYPE_CHECKING:
+    from typing_extensions import Unpack
+
 log = logging.getLogger("thediscordlist")
 
 __all__ = ["Autoposter", "autopost"]
 
 _DISABLED = PostResult(False, None, "disabled")
+
+_GUILD_EVENTS = ("on_guild_join", "on_guild_remove")
+#: The `on_connect`, `on_resumed` and `on_disconnect` forms fire for auto-sharded
+#: clients too, but `on_ready` only once, so a re-identified shard needs its own.
+_SHARD_EVENTS = ("on_connect", "on_ready", "on_shard_ready", "on_resumed", "on_disconnect")
+
+
+class AutopostOptions(TypedDict, total=False):
+    """The keyword options of :func:`autopost`. Defaults live in :class:`Autoposter`."""
+
+    bot_id: int | str | None
+    stats: bool
+    heartbeat: bool
+    commands: bool
+    stats_interval: float
+    heartbeat_interval: float
+    post_empty_commands: bool
+    cluster: tuple[int, int] | None
+    server_count: ServerCountFn | None
 
 
 class Autoposter:
@@ -33,30 +57,23 @@ class Autoposter:
     returns rather than raises, so nothing here can take a bot down.
     """
 
-    def __init__(
-        self,
-        client: Any,
-        api: ApiClient,
-        *,
-        bot_id: str | None = None,
-        stats: bool = True,
-        heartbeat: bool = True,
-        commands: bool = True,
-        stats_interval: float = STATS_MIN_INTERVAL,
-        heartbeat_interval: float = HEARTBEAT_DEFAULT_INTERVAL,
-        post_empty_commands: bool = False,
-        cluster: tuple[int, int] | None = None,
-        server_count: ServerCountFn | None = None,
-    ) -> None:
+    def __init__(self, client: Any, api: ApiClient, **options: Unpack[AutopostOptions]) -> None:
+        if unknown := options.keys() - AutopostOptions.__optional_keys__:
+            raise TypeError(f"unexpected autopost options: {', '.join(sorted(unknown))}")
         self._client = client
         self._api = api
+        bot_id = options.get("bot_id")
         self._bot_id = str(bot_id) if bot_id else None
-        self._want = {"stats": stats, "heartbeat": heartbeat, "commands": commands}
-        self._stats_interval = stats_interval
-        self._heartbeat_interval = heartbeat_interval
-        self._post_empty_commands = post_empty_commands
-        self._cluster = cluster
-        self._server_count = server_count
+        self._want = {
+            "stats": options.get("stats", True),
+            "heartbeat": options.get("heartbeat", True),
+            "commands": options.get("commands", True),
+        }
+        self._stats_interval = options.get("stats_interval", STATS_INTERVAL)
+        self._heartbeat_interval = options.get("heartbeat_interval", HEARTBEAT_DEFAULT_INTERVAL)
+        self._post_empty_commands = options.get("post_empty_commands", False)
+        self._cluster = options.get("cluster")
+        self._server_count = options.get("server_count")
 
         self.topology: Topology | None = None
         self._stats: StatsPublisher | None = None
@@ -125,9 +142,11 @@ class Autoposter:
         if self._want["stats"]:
             self._stats = StatsPublisher(deps, self._stats_interval, self._server_count)
             self._stats.start()
+            _on_events(self._client, _GUILD_EVENTS, self._stats.on_guild_change)
         if self._want["heartbeat"]:
             self._heartbeat = HeartbeatPublisher(deps, self._heartbeat_interval)
             self._heartbeat.start()
+            _on_events(self._client, _SHARD_EVENTS, self._heartbeat.beat_now)
         if self._want["commands"]:
             self._commands = CommandsPublisher(deps, self._post_empty_commands)
             self._commands.start()
@@ -167,16 +186,8 @@ def autopost(
     client: Any,
     token: str | None,
     *,
-    bot_id: int | str | None = None,
     base_url: str = DEFAULT_BASE_URL,
-    stats: bool = True,
-    heartbeat: bool = True,
-    commands: bool = True,
-    stats_interval: float = STATS_MIN_INTERVAL,
-    heartbeat_interval: float = HEARTBEAT_DEFAULT_INTERVAL,
-    post_empty_commands: bool = False,
-    cluster: tuple[int, int] | None = None,
-    server_count: ServerCountFn | None = None,
+    **options: Unpack[AutopostOptions],
 ) -> Autoposter:
     """Wires a Discord client to its TheDiscordList listing.
 
@@ -198,8 +209,11 @@ def autopost(
         bots it differs from the bot user id. Pycord, nextcord and disnake only
         learn it from READY, so without it one ``application_info()`` call is
         made right after login.
-    :param stats_interval: seconds between guild-count checks, and the hard
-        floor between two posts. Clamped to a 60s minimum by the rate limit.
+    :param stats_interval: seconds between guild-count checks, 300 by default.
+        A guild join or removal also posts, 20s after the last one. Clamped to
+        a 60s minimum, which is also the hard floor between two posts.
+    :param heartbeat_interval: the starting cadence, 30 by default and clamped
+        to 15-60s. Each response retunes it from the server's grace window.
     :param post_empty_commands: send an empty command list, which *clears* the
         listing. Off by default.
     :param cluster: ``(cluster_id, cluster_count)`` when the bot's shards are
@@ -210,22 +224,16 @@ def autopost(
     """
     from . import __version__  # deferred: the package is mid-import at module load
 
+    # Forgive a token pasted with surrounding whitespace or its "Bearer " prefix.
+    token = re.sub(r"^bearer\s+", "", (token or "").strip(), flags=re.IGNORECASE)
     poster = Autoposter(
         client,
         ApiClient(
-            token or "",
+            token,
             base_url,
             f"thediscordlist-py/{__version__} ({_library(client)})",
         ),
-        bot_id=str(bot_id) if bot_id else None,
-        stats=stats,
-        heartbeat=heartbeat,
-        commands=commands,
-        stats_interval=stats_interval,
-        heartbeat_interval=heartbeat_interval,
-        post_empty_commands=post_empty_commands,
-        cluster=cluster,
-        server_count=server_count,
+        **options,
     )
 
     if not token:
@@ -278,6 +286,28 @@ def _wire(client: Any, poster: Autoposter) -> None:
         await original_close()
 
     client.close = close
+
+
+def _on_events(client: Any, events: tuple[str, ...], callback: Callable[[], None]) -> None:
+    """Runs ``callback`` on each of ``events``, beside the user's own handlers."""
+
+    async def listener(*_: Any) -> None:
+        callback()
+
+    for event in events:
+        if hasattr(client, "add_listener"):  # commands.Bot
+            client.add_listener(listener, event)
+            continue
+
+        # A plain Client dispatches only to its own on_<event> attribute, so chain onto it.
+        original = getattr(client, event, None)
+
+        async def chained(*args: Any, _original: Any = original) -> None:
+            callback()
+            if _original is not None:
+                await _original(*args)
+
+        setattr(client, event, chained)
 
 
 def _loop_running() -> bool:
