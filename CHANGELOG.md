@@ -1,5 +1,16 @@
 # thediscordlist
 
+## 0.3.0
+
+### Minor Changes
+
+- 5a1f00b: **Install change for discord.py users:** discord.py is no longer installed with the package. Install it through the extra with `pip install "thediscordlist[discordpy]"` (or keep discord.py in your own requirements); a plain `pip install thediscordlist` now pulls in aiohttp only.
+- 5a1f00b: Supports **Pycord** (2.6+), **nextcord** (2.6+, 3.x on Python 3.12+) and **disnake** (2.9+) next to discord.py, chosen with the `discordpy`, `pycord`, `nextcord` and `disnake` extras. The only hard dependency is aiohttp, so installing for Pycord never pulls discord.py in over it.
+
+### Patch Changes
+
+- 8d11c1c: The package builds with hatchling 1.33 or later, and the dev tooling and CI actions are on their latest releases.
+
 ## 0.2.1
 
 ### Patch Changes

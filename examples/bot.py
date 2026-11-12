@@ -1,11 +1,15 @@
-"""A complete integration: auto-posting plus a webhook listener in one process.
+"""A complete discord.py integration: auto-posting plus a webhook listener in one process.
 
-    pip install thediscordlist
+    pip install "thediscordlist[discordpy]"
     TDL_TOKEN=... TDL_WEBHOOK_SECRET=... DISCORD_TOKEN=... python examples/bot.py
 
-The webhook server uses aiohttp, which discord.py already depends on, so this
-whole file needs nothing beyond the package itself. Point your listing's
-Webhooks tab at `http://<your host>:8080/tdl`.
+The webhook server uses aiohttp, this package's one dependency, so this whole
+file needs nothing beyond the package itself. Point your listing's Webhooks tab
+at `http://<your host>:8080/tdl`.
+
+Pycord, nextcord and disnake bots wire up with the same `autopost(bot, token)`
+line; they have no `setup_hook`, so start the webhook server from your own
+startup code instead.
 """
 
 from __future__ import annotations
