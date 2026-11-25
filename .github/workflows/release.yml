@@ -21,7 +21,7 @@ jobs:
             echo "::error::Tag $GITHUB_REF_NAME is not on main"
             exit 1
           fi
-      - uses: astral-sh/setup-uv@v10.3.3
+      - uses: astral-sh/setup-uv@v10.4.0
       - run: uv sync --group dev
       - name: Tag matches __version__
         run: |
